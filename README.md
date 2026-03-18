@@ -98,7 +98,7 @@ RouterLang/
 ### Step 1 — Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/RouterLang.git
+git clone https://github.com/EftodeAndreiFAF242/RouterLang.git
 cd RouterLang
 ```
 
