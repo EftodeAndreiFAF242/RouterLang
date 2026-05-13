@@ -20,6 +20,9 @@ RouterLang is a compiled DSL designed for ISP and enterprise backbone environmen
   - [Policy Block](#policy-block)
   - [Intent Block](#intent-block)
   - [Transition Block](#transition-block)
+  - [Comments](#comments)
+  - [Identifiers and Naming Rules](#identifiers-and-naming-rules)
+  - [Common Mistakes](#common-mistakes)
 - [A Complete Example](#a-complete-example)
 - [Semantic Rules](#semantic-rules)
 - [Config Generation](#config-generation)
@@ -174,13 +177,15 @@ intent     { ... }   -- required
 transition { ... }   -- optional
 ```
 
-Every block is mandatory except `transition`. The order is fixed.
+Every block is mandatory except `transition`. The order is fixed — the compiler rejects any program that deviates from it.
+
+Each block is self-contained and uses `{ }` for grouping. There are no semicolons. Whitespace and indentation are not significant.
 
 ---
 
 ### Topology Block
 
-The topology block defines the logical structure of the network: the roles devices play, how those roles are connected, and which physical devices fill each role.
+The topology block defines the logical structure of the network: the roles devices play, how those roles are connected, and which physical devices fill each role. It is always the first block in the file.
 
 ```
 topology {
@@ -197,13 +202,50 @@ topology {
 }
 ```
 
-**roles** — Named logical categories of device. The `count` field is either an exact integer or a range (`1..8`). Role names must be valid identifiers and must not clash with reserved keywords (`all`, `border`, `auto`, `area`, `route`, `scope`, etc.).
+#### roles
 
-**links** — Undirected connections between roles. The optional `weight` controls routing preference (lower is preferred). A role cannot link to itself.
+Roles are named logical categories — `spine`, `leaf`, `edge`, `border`, `core`, etc. Every other block in the program refers to roles by name, so they must all be declared here first.
 
-**devices** — Maps concrete device hostnames to their role. This section is optional; if omitted, the generator synthesises device names from the role counts (e.g. `R-SPINE-1`, `R-SPINE-2`).
+The `count` field tells RouterLang how many physical devices fill this role. It accepts either an exact integer or a range:
 
-**Example:**
+```
+spine  { count: 2 }       -- exactly 2 spine devices
+leaf   { count: 1..8 }    -- between 1 and 8 leaf devices
+```
+
+Role names follow standard identifier rules (letters, digits, hyphens, underscores; must start with a letter). Avoid names that collide with reserved keywords: `all`, `border`, `auto`, `area`, `route`, `scope`, `any`, `permit`, `deny`, `rank`, `match`, `set`, `from`, `to`.
+
+#### links
+
+Links declare which roles are physically connected to each other. A link is undirected — `spine -- leaf` and `leaf -- spine` are equivalent. Self-links (`spine -- spine`) are not permitted.
+
+The optional `weight` attribute controls routing preference when multiple paths exist. Lower weight is preferred. If omitted, the weight defaults to 1.
+
+```
+links {
+  spine -- leaf  { weight: 1 }    -- preferred path
+  spine -- edge  { weight: 2 }
+  edge  -- leaf  { weight: 3 }    -- least preferred
+}
+```
+
+Links defined here are also used by the intent block to validate path expressions. If an intent declares `edge >> spine >> leaf`, the compiler checks that an `edge -- spine` link and a `spine -- leaf` link both exist.
+
+#### devices
+
+The devices section binds concrete router hostnames to their role. This section is optional — if omitted, the config generator synthesises names automatically (e.g. `R-SPINE-1`, `R-SPINE-2`).
+
+```
+devices {
+  spine: [R-SPINE-1, R-SPINE-2]
+  leaf:  [R-LEAF-1, R-LEAF-2, R-LEAF-3, R-LEAF-4]
+  edge:  [R-EDGE-1, R-EDGE-2]
+}
+```
+
+Each device name must be unique across the entire program. Device names may contain letters, digits, and hyphens. The number of devices listed for a role should be consistent with the role's declared count.
+
+**Full example:**
 
 ```
 topology {
@@ -229,7 +271,7 @@ topology {
 
 ### Routing Block
 
-The routing block configures BGP and OSPF for the network. Both protocols are optional within the block, but at least one must be present.
+The routing block configures BGP and OSPF for the network. It must contain at least one of the two protocol sections.
 
 ```
 routing {
@@ -246,15 +288,51 @@ routing {
 }
 ```
 
-**asn** — Assigns a BGP autonomous system number to each role. Every role participating in BGP must have an ASN.
+#### bgp
 
-**neighbors: auto** — RouterLang automatically establishes BGP sessions between all devices in adjacent roles (as defined by the topology links). Use an explicit peer list if you need manual control.
+The `bgp` section configures BGP autonomous system numbers and session topology.
 
-**route-reflector** — Designates a role as the BGP route reflector. Devices in this role will be generated with `bgp cluster-id` and `route-reflector-client` configuration for their peers.
+**asn** — Assigns a BGP autonomous system number to each role. Every role that participates in BGP must have an entry here. ASN values are standard 16-bit or 32-bit integers. Using private ASN ranges (64512–65534 for 16-bit, 4200000000–4294967294 for 32-bit) is conventional for internal networks.
 
-**ospf / area** — Assigns roles to OSPF areas. A role can appear in only one area.
+```
+asn {
+  spine: 65001
+  leaf:  65002
+  edge:  65003
+}
+```
 
-**Example:**
+**neighbors: auto** — Instructs RouterLang to automatically establish BGP sessions between all devices whose roles are connected by a link in the topology block. This is the recommended mode for most networks. The generated configuration will contain one `neighbor` statement per peer in every adjacent role.
+
+If you need fine-grained control over peering, you can replace `neighbors: auto` with an explicit peer list:
+
+```
+neighbors {
+  R-SPINE-1: 10.0.0.1
+  R-SPINE-2: 10.0.0.2
+}
+```
+
+**route-reflector** — Designates a role as the BGP route reflector for the AS. All devices in this role will be generated with `bgp cluster-id 1` and will treat their peers as route-reflector clients. This is typically the `spine` role in a Clos topology, since spine devices have visibility to all other roles.
+
+```
+route-reflector: spine
+```
+
+#### ospf
+
+The `ospf` section assigns roles to OSPF areas. Multiple areas are supported. Each role may appear in at most one area.
+
+```
+ospf {
+  area 0 { roles: [spine, leaf] }
+  area 1 { roles: [edge] }
+}
+```
+
+Area 0 is the OSPF backbone area. Roles in area 0 form the core of the OSPF domain. Roles in non-zero areas must have connectivity to area 0 through the topology — the compiler validates path connectivity but does not enforce OSPF area border router rules explicitly.
+
+**Full example:**
 
 ```
 routing {
@@ -278,46 +356,76 @@ routing {
 
 ### Policy Block
 
-The policy block defines named routing policies. Each policy contains one or more ranked stanzas evaluated in rank order (first match wins).
+The policy block defines named routing policies. A policy is a prioritised list of stanzas, each with a match condition and an action. Stanzas are evaluated top-down in rank order; the first stanza whose `match` condition is satisfied determines the outcome for that route. This is called first-match semantics.
 
 ```
 policy {
   define <POLICY-NAME> {
     rank <N>: permit {
-      match prefix <CIDR> le <N>
-      set local-pref <N>
-      if neighbor.state == LIVE
+      match <expression>
+      set   <expression>
+      if    <condition>
     }
     rank <N>: deny {
-      match any
+      match <expression>
     }
   }
 }
 ```
 
-**rank** — Numeric priority. Lower numbers are evaluated first. Ranks must be unique within a policy.
+Policy names use uppercase identifiers by convention (e.g. `PREFER-PRIMARY`, `BLOCK-BOGONS`), though any valid identifier is accepted. A program can define multiple policies; each must have a unique name.
 
-**permit / deny** — The action taken when a route matches this stanza.
+#### rank
 
-**match** — Specifies what routes this stanza applies to. Options:
+The `rank` keyword assigns a numeric priority to a stanza. Lower numbers are evaluated first. Ranks must be unique within a policy — duplicate ranks are a semantic error (E-7). It is conventional to space ranks in increments of 10 (10, 20, 30...) to leave room for future insertions.
 
-| Match expression | Meaning |
+```
+rank 10: permit { ... }
+rank 20: permit { ... }
+rank 30: deny   { ... }
+```
+
+#### permit and deny
+
+`permit` allows matching routes to pass and optionally modifies their attributes via `set`. `deny` drops matching routes silently. A policy with no explicit catch-all `deny` at the end will implicitly permit anything that does not match an earlier stanza.
+
+It is good practice to end every policy with an explicit `deny { match any }` to make the default behaviour clear.
+
+#### match
+
+The `match` clause specifies which routes the stanza applies to. Exactly one match expression is allowed per stanza.
+
+| Expression | Description |
 |---|---|
-| `match prefix <CIDR> le <N>` | Routes within the prefix, up to length N |
-| `match aspath "<regex>"` | Routes whose AS-path matches the expression |
-| `match community "<value>"` | Routes carrying the specified community |
-| `match any` | All routes (catch-all) |
+| `match prefix <CIDR> le <N>` | Matches routes within the given prefix, up to prefix length N. For example, `match prefix 10.0.0.0/8 le 24` matches any subnet of `10.0.0.0/8` with a prefix length of 24 or shorter. |
+| `match aspath "<regex>"` | Matches routes whose BGP AS-path string matches the given regular expression. |
+| `match community "<value>"` | Matches routes carrying the specified BGP community string. |
+| `match any` | Matches all routes unconditionally. Used as a catch-all at the end of a policy. |
 
-**set** — Modifies route attributes for permitted routes:
+#### set
 
-| Set expression | Meaning |
+The `set` clause modifies an attribute of routes that match a `permit` stanza. It has no effect inside a `deny` stanza.
+
+| Expression | Description |
 |---|---|
-| `set local-pref <N>` | Overrides the local preference |
-| `set metric <N>` | Sets the route metric |
+| `set local-pref <N>` | Sets the BGP local preference. Higher values are preferred. Used to influence outbound path selection within an AS. |
+| `set metric <N>` | Sets the route metric (MED in BGP). Lower values are preferred by the receiving AS. |
 
-**if** — An optional guard condition. The stanza only applies when the condition holds. Currently supports `neighbor.state == LIVE`, `neighbor.state == DRAINED`, and `neighbor.state == WARM`.
+#### if
 
-**Example:**
+The `if` clause is an optional guard condition that further restricts when a stanza fires. It is evaluated after the `match` expression. If the condition is false, the stanza is skipped and evaluation continues to the next rank.
+
+Currently supported conditions:
+
+| Condition | Meaning |
+|---|---|
+| `if neighbor.state == LIVE` | Peer is active and in full session |
+| `if neighbor.state == DRAINED` | Peer is administratively drained |
+| `if neighbor.state == WARM` | Peer is in warm standby state |
+
+This is typically used to implement primary/backup path logic: allow a preferred route only when the primary peer is live, otherwise fall through to a lower-preference stanza.
+
+**Full example:**
 
 ```
 policy {
@@ -338,11 +446,13 @@ policy {
 }
 ```
 
+Reading this policy: if the neighbor is live and the route falls within `192.168.0.0/16`, prefer it strongly (local-pref 300). If the neighbor is not live, or the route does not match that prefix, fall through to rank 20 and permit it with a weaker preference (local-pref 100). Finally, drop the default route entirely.
+
 ---
 
 ### Intent Block
 
-The intent block describes the desired traffic behaviour at a high level. RouterLang validates that the declared paths are topologically valid before generating any configuration.
+The intent block declares high-level traffic path requirements. Rather than specifying which interface to configure on which device, you declare where you want traffic to flow and under what constraints — RouterLang works out the per-device implications during config generation.
 
 ```
 intent {
@@ -356,15 +466,55 @@ intent {
 }
 ```
 
-**primary / backup** — Ordered role sequences that define the preferred and fallback traffic paths. Each consecutive pair of roles must be connected by a link in the topology block.
+Intent names use uppercase identifiers by convention. The `route` keyword introduces a routing intent; the `<label>` after it is a free-form identifier that names the traffic class (e.g. `backbone`, `datacenter`, `management`).
 
-**apply-policy** — References a policy defined in the policy block. The named policy must exist.
+#### primary and backup
 
-**fault-tolerance** — The number of edge-disjoint paths required. Must be 1 or greater.
+Path expressions describe the sequence of roles traffic must traverse, from ingress to egress. The `>>` operator separates consecutive hops.
 
-**scope** — Which devices the intent applies to. Use `all` to apply to every device, or list specific role names.
+```
+primary: edge >> spine >> leaf
+backup:  edge >> leaf
+```
 
-**Example:**
+The compiler validates every path against the topology:
+
+- Each role in the path must be declared in the topology block (E-10).
+- Every consecutive pair of roles in the path must be connected by a link (E-11).
+- The backup path must differ from the primary path (E-12).
+
+A path must contain at least two roles (a single-hop path is a syntax error). There is no upper limit on path length.
+
+The `backup` line is optional. If omitted, no fallback path is declared for this intent.
+
+#### apply-policy
+
+References a policy from the policy block by name. The named policy must exist — referencing an undefined policy is a semantic error (E-8). During config generation, the referenced policy is emitted as a route-map on every device involved in this intent.
+
+```
+apply-policy: PREFER-PRIMARY
+```
+
+#### fault-tolerance
+
+Declares the minimum number of edge-disjoint paths required between the endpoints of this intent. Must be 1 or greater — a value of 0 is a semantic error (E-13).
+
+```
+fault-tolerance: 2
+```
+
+A value of 2 means the network must support at least two independent paths, so that a single link failure does not interrupt traffic. This is validated logically; the compiler checks that a backup path exists when `fault-tolerance` is greater than 1.
+
+#### scope
+
+Controls which devices the intent configuration is written to. Use `all` to apply the intent to every device in the network, or list specific role names to restrict application.
+
+```
+scope: all
+scope: edge, spine
+```
+
+**Full example:**
 
 ```
 intent {
@@ -378,21 +528,103 @@ intent {
 }
 ```
 
+Multiple intents can coexist in the same block, each with a unique name:
+
+```
+intent {
+  CORE-TRAFFIC: route backbone {
+    primary: edge >> spine >> leaf
+    backup:  edge >> leaf
+    apply-policy: PREFER-PRIMARY
+    fault-tolerance: 2
+    scope: all
+  }
+
+  MGMT-TRAFFIC: route management {
+    primary: edge >> spine
+    apply-policy: BLOCK-BOGONS
+    fault-tolerance: 1
+    scope: edge
+  }
+}
+```
+
 ---
 
 ### Transition Block
 
-The optional transition block describes a live migration from one topology state to another.
+The optional transition block describes a planned live migration from one topology state to another. It is placed at the end of the file, after the intent block.
 
 ```
 transition {
-  from: <topology-name>
-  to:   <topology-name>
-  intermediate: <topology-name>
+  from: <name>
+  to:   <name>
+  intermediate: <name>
 }
 ```
 
-This block is informational for the current release — it is parsed and validated but does not yet influence config generation.
+The three fields name the source topology, the target topology, and an intermediate state used during the cutover. These are free-form identifiers — they label the migration stages for documentation purposes.
+
+```
+transition {
+  from: spine-v1
+  to:   spine-v2
+  intermediate: spine-hybrid
+}
+```
+
+This block is parsed and validated in the current release but does not yet influence config generation. It is intended for future support of incremental rollout planning.
+
+---
+
+### Comments
+
+RouterLang supports two comment styles:
+
+```
+// This is a single-line comment
+
+/* This is a
+   block comment */
+```
+
+Comments can appear anywhere whitespace is allowed. They are stripped during lexing and have no effect on compilation.
+
+---
+
+### Identifiers and Naming Rules
+
+Identifiers in RouterLang follow this pattern: they must start with a letter (`a-z`, `A-Z`) and may be followed by any combination of letters, digits, underscores (`_`), and hyphens (`-`).
+
+Valid: `spine`, `R-LEAF-1`, `PREFER-PRIMARY`, `area_core`, `bgp-peer-01`
+
+Invalid: `1spine` (starts with digit), `spine leaf` (contains space), `spine.leaf` (contains dot outside a guard expression)
+
+Policy names are conventionally written in `UPPER-KEBAB-CASE`. Role names are conventionally written in `lower-kebab-case`. Device names typically follow your organisation's existing hostname convention.
+
+---
+
+### Common Mistakes
+
+**Referencing a role before declaring it**
+
+All roles must be declared in the `roles` section of the topology block before they can be used in links, ASN assignments, OSPF areas, or path expressions.
+
+**Declaring a link between roles with no path in the intent**
+
+A link in the topology block does not automatically create a path in an intent. Paths must be declared explicitly in the intent block, and every hop in the path must have a corresponding link.
+
+**Using a reserved keyword as a role name**
+
+Names like `all`, `border`, `route`, `area`, and `scope` are reserved. Using them as role names produces a parse error.
+
+**Forgetting the backup path with fault-tolerance > 1**
+
+If `fault-tolerance: 2` is declared but no `backup` path is provided, the intent cannot be satisfied. The compiler will flag this.
+
+**Omitting a policy that is referenced by an intent**
+
+The policy must be defined before the intent block is compiled. If `apply-policy: MY-POLICY` is present in an intent but `MY-POLICY` is not defined in the policy block, this is a semantic error (E-8).
 
 ---
 
@@ -471,13 +703,13 @@ R-LEAF-1.cfg     R-LEAF-2.cfg     R-LEAF-3.cfg     R-LEAF-4.cfg
 R-EDGE-1.cfg     R-EDGE-2.cfg
 ```
 
-Each file contains the hostname declaration, OSPF process configuration, BGP session configuration (with all adjacent-role peers), route-map stubs derived from the policy block, and informational comments describing the intents.
+Each file contains the hostname declaration, OSPF process configuration, BGP session configuration with all adjacent-role peers, route-map stubs derived from the policy block, and informational comments describing the intents.
 
 ---
 
 ## Semantic Rules
 
-RouterLang enforces 14 rules at compile time. All errors must be resolved before a configuration can be generated.
+RouterLang enforces 14 rules at compile time. All errors must be resolved before a configuration can be generated. Warnings are reported but do not block generation.
 
 | Code | Rule | Severity |
 |---|---|---|
@@ -496,23 +728,23 @@ RouterLang enforces 14 rules at compile time. All errors must be resolved before
 | E-13 | `fault-tolerance` set to zero on a route intent | Error |
 | E-14 | BGP ASN assigned to an undeclared role | Error |
 
-Warnings do not prevent config generation. Errors do.
-
 ---
 
 ## Config Generation
 
 When all four validation stages pass, `--generate` produces Cisco IOS-style configuration files. Each file includes:
 
-- **hostname** — The device name as declared in the `devices` section.
-- **OSPF** — A `router ospf 1` block with the correct area assignment for that device's role.
-- **BGP** — A `router bgp <ASN>` block with one `neighbor` entry per peer device in adjacent roles. Route-reflector devices include `bgp cluster-id` and `route-reflector-client` statements.
-- **Route-maps** — One `route-map` per policy, with a sequence entry per rank.
-- **Intent comments** — Human-readable annotations describing the primary path, backup path, applied policy, and fault-tolerance requirement.
+**hostname** — The device name as declared in the `devices` section.
 
-Router IDs and peer IP addresses are derived deterministically from device names when no explicit IP addresses are provided in the source.
+**OSPF** — A `router ospf 1` block with a deterministic router ID and the correct area assignment for that device's role.
 
-Generated files should be reviewed by a network engineer before being applied to any live device.
+**BGP** — A `router bgp <ASN>` block with one `neighbor` entry per peer device in all adjacent roles. Each neighbor entry includes `remote-as`, `description`, and `update-source Loopback0`. Route-reflector devices additionally include `bgp cluster-id 1` and `route-reflector-client` per peer.
+
+**Route-maps** — One `route-map` block per policy defined in the source, with a numbered sequence entry per rank. The sequence entries include comment stubs indicating where match and set clauses should be filled in for the target platform.
+
+**Intent comments** — Human-readable annotations at the end of the file describing the primary path, backup path, applied policy, and fault-tolerance requirement for each declared intent.
+
+Router IDs and peer IP addresses are derived deterministically from device names when no explicit IP addresses are provided in the source. Generated files should be reviewed by a network engineer before being applied to any live device.
 
 ---
 
