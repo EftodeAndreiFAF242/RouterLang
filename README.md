@@ -1,58 +1,62 @@
 # RouterLang
 
-> A domain-specific language for declarative network topology and routing policy.  
-> RouterLang validates BGP/OSPF network configurations for ISP and enterprise backbone environments.
+**A domain-specific language for declarative network topology and routing policy.**
+
+RouterLang is a compiled DSL designed for ISP and enterprise backbone environments. Instead of writing vendor-specific configuration files by hand, RouterLang lets network engineers describe their infrastructure declaratively — topology, protocols, routing policy, traffic intents — and compile it into validated, per-device configuration files ready for deployment.
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Language Features](#language-features)
+- [What Problem It Solves](#what-problem-it-solves)
+- [How It Works](#how-it-works)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
-- [Running the Lexer](#running-the-lexer)
-- [Running the Parser](#running-the-parser)
-- [Running the Semantic Checker](#running-the-semantic-checker)
-- [Language Syntax](#language-syntax)
-- [Grammar Complexity](#grammar-complexity)
+- [Usage](#usage)
+- [Language Reference](#language-reference)
+  - [Program Structure](#program-structure)
+  - [Topology Block](#topology-block)
+  - [Routing Block](#routing-block)
+  - [Policy Block](#policy-block)
+  - [Intent Block](#intent-block)
+  - [Transition Block](#transition-block)
+  - [Comments](#comments)
+  - [Identifiers and Naming Rules](#identifiers-and-naming-rules)
+  - [Common Mistakes](#common-mistakes)
+- [A Complete Example](#a-complete-example)
 - [Semantic Rules](#semantic-rules)
-- [Test Cases](#test-cases)
-- [Example Program](#example-program)
-- [Weekly Progress](#weekly-progress)
+- [Config Generation](#config-generation)
+- [Authors](#authors)
 
 ---
 
-## Overview
+## What Problem It Solves
 
-RouterLang is a domain-specific language (DSL) designed for specifying network topology and routing policy in ISP and enterprise backbone environments. Instead of manually writing vendor-specific BGP configurations, RouterLang allows network engineers to declaratively describe:
+Configuring a real network means writing hundreds of lines of vendor-specific CLI commands — once per device, by hand. A small topology change can require touching every router in the network, with no compile-time safety net.
 
-- **Network topology** — roles, links, devices
-- **Routing configuration** — BGP autonomous systems, OSPF areas, neighbor relationships
-- **Routing policy** — ranked permit/deny rules with prefix, AS-path, and community matching
-- **High-level intents** — desired traffic paths with fault-tolerance requirements
-- **Network transitions** — live migration between topologies
+RouterLang solves this by separating **intent** from **implementation**:
 
-RouterLang validates network configurations at compile time, catching structural and semantic errors before any deployment occurs.
+1. You describe the network once, at a high level, in a `.rl` file.
+2. RouterLang validates it — catching structural and semantic errors before anything touches a live device.
+3. RouterLang generates one configuration file per device, ready to apply.
 
 ---
 
-## Language Features
+## How It Works
 
-- Declarative topology definition with named roles and weighted links
-- BGP configuration with automatic or explicit neighbor discovery
-- OSPF area configuration with role membership
-- Ranked routing policy with first-match semantics
-- Generalised conditional guards (`if role.attribute == value`)
-- High-level path intents with primary and backup paths
-- Fault-tolerance specification (k edge-disjoint paths)
-- Scope-based policy application (`all`, `border`, or specific roles)
-- Live network migration support via transition blocks
-- Fully unambiguous grammar — 41 productions, 38 lexical tokens
-- ANTLR4-based lexer with coloured token stream output and summary statistics
-- ANTLR4-based parser with syntax error reporting
-- Full symbol table with roles, links, devices, policies, intents, and transitions
-- Semantic checker with 14 validation rules (errors + warnings), integrated with the ANTLR parse tree
+A `.rl` source file passes through a five-stage pipeline:
+
+```
+Source (.rl)
+    │
+    ├─ Stage 1 — Lexer          tokenises the source
+    ├─ Stage 2 — Parser         builds the parse tree (ANTLR4)
+    ├─ Stage 3 — Symbol Table   collects all declared symbols
+    ├─ Stage 4 — Semantic Check enforces 14 validation rules
+    └─ Stage 5 — Config Gen     emits one .cfg file per device
+```
+
+The first four stages always run. The fifth runs only when you pass `--generate`.
 
 ---
 
@@ -63,61 +67,55 @@ RouterLang/
 │
 ├── src/
 │   ├── grammar/
-│   │   └── RouterLang.g4              # ANTLR4 grammar definition
+│   │   └── RouterLang.g4              # ANTLR4 grammar — 41 productions, 38 tokens
 │   ├── parser/
 │   │   ├── RouterLangLexer.py         # Auto-generated by ANTLR
 │   │   ├── RouterLangParser.py        # Auto-generated by ANTLR
-│   │   ├── RouterLangVisitor.py       # Auto-generated by ANTLR
-│   │   └── RouterLangListener.py      # Auto-generated by ANTLR
+│   │   ├── RouterLangListener.py      # Auto-generated by ANTLR
+│   │   └── RouterLangVisitor.py       # Auto-generated by ANTLR
 │   └── compiler/
-│       ├── semantic_checker.py        # Semantic analysis — 14 rules, ANTLR listener integration
-│       └── symbol_table.py            # Symbol table builder — roles, links, policies, intents
+│       ├── symbol_table.py            # Symbol table builder
+│       ├── semantic_checker.py        # 14-rule semantic analyser
+│       └── config_generator.py        # Per-device .cfg file generator
 │
 ├── tests/
 │   ├── valid/
-│   │   └── minimal_program.rl         # Valid RouterLang sample
+│   │   └── minimal_program.rl
 │   └── invalid/
-│       ├── empty_routing.rl           # Invalid — empty routing block
-│       └── single_hop_path.rl         # Invalid — single hop path
+│       ├── empty_routing.rl
+│       └── single_hop_path.rl
 │
 ├── examples/
-│   └── (add your .rl examples here)
-│
 ├── docs/
-│   └── week6_report.pdf               # Grammar and semantics report
-│
-├── lexer_analyzer.py                  # Standalone lexer with coloured token output
+├── main.py                            # Main entry point
+├── lexer_analyzer.py                  # Standalone lexer tool
 ├── test_parser.py                     # Parser test runner
-├── test_lexer_symtable.py             # Lexer + symbol table test runner
-├── requirements.txt                   # Python dependencies
-└── README.md
+├── test_lexer_symtable.py             # Lexer + symbol table tests
+└── requirements.txt
 ```
 
 ---
 
 ## Installation
 
-### Prerequisites
+**Prerequisites:** Python 3.12 or later. Java 11 or later (only needed to regenerate the parser from the grammar — not required for normal use).
 
-- Python 3.12+
-- Java 11+ (required for ANTLR)
-
-### Step 1 — Clone the repository
+**Step 1 — Clone the repository**
 
 ```bash
 git clone https://github.com/EftodeAndreiFAF242/RouterLang.git
 cd RouterLang
 ```
 
-### Step 2 — Install Python dependencies
+**Step 2 — Install the runtime dependency**
 
 ```bash
-python -m pip install antlr4-python3-runtime==4.13.1
+pip install antlr4-python3-runtime==4.13.1
 ```
 
-### Step 3 — (Optional) Regenerate the parser from grammar
+**Step 3 — (Optional) Regenerate the parser after grammar changes**
 
-If you modify `RouterLang.g4`, regenerate the parser with:
+If you modify `src/grammar/RouterLang.g4`, regenerate the parser with:
 
 ```bash
 java -jar antlr-4.13.1-complete.jar -Dlanguage=Python3 -visitor -o src/parser src/grammar/RouterLang.g4
@@ -125,145 +123,51 @@ java -jar antlr-4.13.1-complete.jar -Dlanguage=Python3 -visitor -o src/parser sr
 
 ---
 
-## Running the Lexer
+## Usage
 
-The lexer analyzer reads any `.rl` file and prints a formatted, colour-coded token stream.
+### Validate a source file
 
 ```bash
-# Run on a file
-python lexer_analyzer.py tests/valid/minimal_program.rl
-
-# Run on the built-in demo source
-python lexer_analyzer.py
-
-# Show token-type frequency summary
-python lexer_analyzer.py --summary
-
-# Include hidden whitespace/comment tokens
-python lexer_analyzer.py --hidden
+python main.py my_network.rl
 ```
 
-Example output:
+### Validate and generate device configuration files
 
+```bash
+python main.py my_network.rl --generate
 ```
- LINE   COL  TOKEN TYPE            TEXT
-─────────────────────────────────────────────────────────────────
-    1     0  KEYWORD               'topology'
-    1     9  PUNCT                 '{'
-    2     2  KEYWORD               'roles'
-    2     8  PUNCT                 '{'
-    3     4  IDENT                 'spine'
-    ...
-─────────────────────────────────────────────────────────────────
-Total tokens: 47 (visible)
+
+Configuration files are written to `./output/my_network/` by default — one `.cfg` per device declared in the source.
+
+### Specify a custom output directory
+
+```bash
+python main.py my_network.rl --generate --out-dir ./configs/production
 ```
+
+### Run the built-in example
+
+```bash
+python main.py --example --generate
+```
+
+### Additional flags
+
+| Flag | Effect |
+|---|---|
+| `--tokens` | Print the full token stream after lexing |
+| `--symbols` | Print the symbol table after parsing |
+| `--verbose` | Enable both `--tokens` and `--symbols` |
+| `--generate` | Run Stage 5 and emit `.cfg` files |
+| `--out-dir <path>` | Set output directory for generated configs |
 
 ---
 
-## Running the Parser
+## Language Reference
 
-```bash
-python test_parser.py
-```
+### Program Structure
 
-Expected output:
-
-```
-✅ ACCEPTED — minimal valid program
-❌ REJECTED — empty routing block — should be rejected
-   Line 3:10 — mismatched input '}' expecting {'bgp', 'ospf'}
-❌ REJECTED — single hop path — should be rejected
-   Line 4:35 — mismatched input '}' expecting '>>'
-✅ ACCEPTED — valid guard expression — should be accepted
-✅ ACCEPTED — valid explicit peer list — should be accepted
-✅ ACCEPTED — valid prefix match and local-pref — should be accepted
-✅ ACCEPTED — valid multi-hop path with backup — should be accepted
-✅ ACCEPTED — valid deny then permit policy — should be accepted
-```
-
----
-
-## Running the Semantic Checker
-
-The semantic checker walks the ANTLR parse tree via a listener and validates all 14 semantic rules. It has two modes: a standalone test suite and a programmatic API for use in other tools.
-
-```bash
-python src/compiler/semantic_checker.py
-```
-
-Expected output (30 tests):
-
-```
-════════════════════════════════════════════════════════════
-  RouterLang Semantic Checker — Test Suite
-════════════════════════════════════════════════════════════
-
-── Topology ─────────────────────────────────────────────
-  ✅ PASS  T-01  Valid exact-count role
-  ✅ PASS  T-02  Valid range role (1..8)
-  ✅ PASS  T-03  E-1  Duplicate role name
-  ✅ PASS  T-04  E-2  Role with count 0
-  ✅ PASS  T-05  E-3  Inverted range (5..2)
-  ✅ PASS  T-06  Valid link between declared roles
-  ✅ PASS  T-07  E-4  Link to undeclared role
-  ✅ PASS  T-08  E-6  Reflexive link
-  ✅ PASS  T-09  W-5  Duplicate link (warning only)
-  ✅ PASS  T-09b W-5  Duplicate link is non-fatal
-
-── Routing / ASN ────────────────────────────────────────
-  ✅ PASS  R-01  Valid ASN assignment
-  ✅ PASS  R-02  E-14  ASN to undeclared role
-
-── Policy ───────────────────────────────────────────────
-  ✅ PASS  P-01  Valid unique ranks
-  ✅ PASS  P-02  E-7  Duplicate rank in policy
-  ✅ PASS  P-03  Same rank in different policies (OK)
-
-── Path expressions ─────────────────────────────────────
-  ✅ PASS  X-01  Valid two-hop path r1 >> r2
-  ✅ PASS  X-02  E-10  Undeclared role in path
-  ✅ PASS  X-03  E-11  Disconnected hop in path
-  ✅ PASS  X-04  Valid three-hop path r1 >> r2 >> r3
-
-── Intent declarations ──────────────────────────────────
-  ✅ PASS  I-01  Valid route intent
-  ✅ PASS  I-02  E-9  Duplicate intent name
-  ✅ PASS  I-03  E-8  Undefined policy reference
-  ✅ PASS  I-04  E-12  Backup == primary path
-  ✅ PASS  I-05  E-13  fault-tolerance k=0
-  ✅ PASS  I-06  Valid intent with distinct backup path
-
-── Integration (ANTLR listener) ─────────────────────────
-  ✅ PASS  A-01  Full valid program via ANTLR
-  ✅ PASS  A-02  E-1  Duplicate role via ANTLR
-  ✅ PASS  A-03  E-8  Undefined policy ref via ANTLR
-  ✅ PASS  A-04  E-11  Disconnected path hop via ANTLR
-  ✅ PASS  A-05  E-7  Duplicate rank via ANTLR
-
-════════════════════════════════════════════════════════════
-  Results: 30/30 passed
-════════════════════════════════════════════════════════════
-```
-
-### Using the checker API
-
-```python
-from src.compiler.semantic_checker import analyze
-
-source = open("my_network.rl").read()
-checker = analyze(source)
-
-if checker.has_errors():
-    print(checker.report())
-else:
-    print("Configuration is valid.")
-```
-
----
-
-## Language Syntax
-
-A RouterLang program consists of five blocks in strict order:
+A RouterLang program consists of up to five blocks, in this order:
 
 ```
 topology   { ... }   -- required
@@ -273,20 +177,87 @@ intent     { ... }   -- required
 transition { ... }   -- optional
 ```
 
+Every block is mandatory except `transition`. The order is fixed — the compiler rejects any program that deviates from it.
+
+Each block is self-contained and uses `{ }` for grouping. There are no semicolons. Whitespace and indentation are not significant.
+
+---
+
 ### Topology Block
 
-Defines network roles, physical links, and device bindings.
+The topology block defines the logical structure of the network: the roles devices play, how those roles are connected, and which physical devices fill each role. It is always the first block in the file.
+
+```
+topology {
+  roles {
+    <role-name>  { count: <N> }
+    <role-name>  { count: <min>..<max> }
+  }
+  links {
+    <role> -- <role>  { weight: <N> }
+  }
+  devices {
+    <role>: [<device-name>, <device-name>, ...]
+  }
+}
+```
+
+#### roles
+
+Roles are named logical categories — `spine`, `leaf`, `edge`, `border`, `core`, etc. Every other block in the program refers to roles by name, so they must all be declared here first.
+
+The `count` field tells RouterLang how many physical devices fill this role. It accepts either an exact integer or a range:
+
+```
+spine  { count: 2 }       -- exactly 2 spine devices
+leaf   { count: 1..8 }    -- between 1 and 8 leaf devices
+```
+
+Role names follow standard identifier rules (letters, digits, hyphens, underscores; must start with a letter). Avoid names that collide with reserved keywords: `all`, `border`, `auto`, `area`, `route`, `scope`, `any`, `permit`, `deny`, `rank`, `match`, `set`, `from`, `to`.
+
+#### links
+
+Links declare which roles are physically connected to each other. A link is undirected — `spine -- leaf` and `leaf -- spine` are equivalent. Self-links (`spine -- spine`) are not permitted.
+
+The optional `weight` attribute controls routing preference when multiple paths exist. Lower weight is preferred. If omitted, the weight defaults to 1.
+
+```
+links {
+  spine -- leaf  { weight: 1 }    -- preferred path
+  spine -- edge  { weight: 2 }
+  edge  -- leaf  { weight: 3 }    -- least preferred
+}
+```
+
+Links defined here are also used by the intent block to validate path expressions. If an intent declares `edge >> spine >> leaf`, the compiler checks that an `edge -- spine` link and a `spine -- leaf` link both exist.
+
+#### devices
+
+The devices section binds concrete router hostnames to their role. This section is optional — if omitted, the config generator synthesises names automatically (e.g. `R-SPINE-1`, `R-SPINE-2`).
+
+```
+devices {
+  spine: [R-SPINE-1, R-SPINE-2]
+  leaf:  [R-LEAF-1, R-LEAF-2, R-LEAF-3, R-LEAF-4]
+  edge:  [R-EDGE-1, R-EDGE-2]
+}
+```
+
+Each device name must be unique across the entire program. Device names may contain letters, digits, and hyphens. The number of devices listed for a role should be consistent with the role's declared count.
+
+**Full example:**
 
 ```
 topology {
   roles {
     spine  { count: 2 }
-    leaf   { count: 1..8 }
+    leaf   { count: 4 }
     edge   { count: 2 }
   }
   links {
-    spine -- leaf   { weight: 1 }
-    spine -- edge   { weight: 2 }
+    spine -- leaf  { weight: 1 }
+    spine -- edge  { weight: 2 }
+    edge  -- leaf  { weight: 3 }
   }
   devices {
     spine: [R-SPINE-1, R-SPINE-2]
@@ -296,11 +267,72 @@ topology {
 }
 ```
 
-> **Note:** Role names must be valid identifiers (`[a-zA-Z][a-zA-Z0-9_-]*`). Avoid names that clash with reserved keywords such as `all`, `border`, `auto`, `area`, `route`, `scope`, etc.
+---
 
 ### Routing Block
 
-Configures BGP and OSPF routing protocols.
+The routing block configures BGP and OSPF for the network. It must contain at least one of the two protocol sections.
+
+```
+routing {
+  bgp {
+    asn {
+      <role>: <ASN>
+    }
+    neighbors: auto
+    route-reflector: <role>
+  }
+  ospf {
+    area <N> { roles: [<role>, ...] }
+  }
+}
+```
+
+#### bgp
+
+The `bgp` section configures BGP autonomous system numbers and session topology.
+
+**asn** — Assigns a BGP autonomous system number to each role. Every role that participates in BGP must have an entry here. ASN values are standard 16-bit or 32-bit integers. Using private ASN ranges (64512–65534 for 16-bit, 4200000000–4294967294 for 32-bit) is conventional for internal networks.
+
+```
+asn {
+  spine: 65001
+  leaf:  65002
+  edge:  65003
+}
+```
+
+**neighbors: auto** — Instructs RouterLang to automatically establish BGP sessions between all devices whose roles are connected by a link in the topology block. This is the recommended mode for most networks. The generated configuration will contain one `neighbor` statement per peer in every adjacent role.
+
+If you need fine-grained control over peering, you can replace `neighbors: auto` with an explicit peer list:
+
+```
+neighbors {
+  R-SPINE-1: 10.0.0.1
+  R-SPINE-2: 10.0.0.2
+}
+```
+
+**route-reflector** — Designates a role as the BGP route reflector for the AS. All devices in this role will be generated with `bgp cluster-id 1` and will treat their peers as route-reflector clients. This is typically the `spine` role in a Clos topology, since spine devices have visibility to all other roles.
+
+```
+route-reflector: spine
+```
+
+#### ospf
+
+The `ospf` section assigns roles to OSPF areas. Multiple areas are supported. Each role may appear in at most one area.
+
+```
+ospf {
+  area 0 { roles: [spine, leaf] }
+  area 1 { roles: [edge] }
+}
+```
+
+Area 0 is the OSPF backbone area. Roles in area 0 form the core of the OSPF domain. Roles in non-zero areas must have connectivity to area 0 through the topology — the compiler validates path connectivity but does not enforce OSPF area border router rules explicitly.
+
+**Full example:**
 
 ```
 routing {
@@ -320,15 +352,86 @@ routing {
 }
 ```
 
+---
+
 ### Policy Block
 
-Defines ranked routing policies with match/set/guard rules.
+The policy block defines named routing policies. A policy is a prioritised list of stanzas, each with a match condition and an action. Stanzas are evaluated top-down in rank order; the first stanza whose `match` condition is satisfied determines the outcome for that route. This is called first-match semantics.
+
+```
+policy {
+  define <POLICY-NAME> {
+    rank <N>: permit {
+      match <expression>
+      set   <expression>
+      if    <condition>
+    }
+    rank <N>: deny {
+      match <expression>
+    }
+  }
+}
+```
+
+Policy names use uppercase identifiers by convention (e.g. `PREFER-PRIMARY`, `BLOCK-BOGONS`), though any valid identifier is accepted. A program can define multiple policies; each must have a unique name.
+
+#### rank
+
+The `rank` keyword assigns a numeric priority to a stanza. Lower numbers are evaluated first. Ranks must be unique within a policy — duplicate ranks are a semantic error (E-7). It is conventional to space ranks in increments of 10 (10, 20, 30...) to leave room for future insertions.
+
+```
+rank 10: permit { ... }
+rank 20: permit { ... }
+rank 30: deny   { ... }
+```
+
+#### permit and deny
+
+`permit` allows matching routes to pass and optionally modifies their attributes via `set`. `deny` drops matching routes silently. A policy with no explicit catch-all `deny` at the end will implicitly permit anything that does not match an earlier stanza.
+
+It is good practice to end every policy with an explicit `deny { match any }` to make the default behaviour clear.
+
+#### match
+
+The `match` clause specifies which routes the stanza applies to. Exactly one match expression is allowed per stanza.
+
+| Expression | Description |
+|---|---|
+| `match prefix <CIDR> le <N>` | Matches routes within the given prefix, up to prefix length N. For example, `match prefix 10.0.0.0/8 le 24` matches any subnet of `10.0.0.0/8` with a prefix length of 24 or shorter. |
+| `match aspath "<regex>"` | Matches routes whose BGP AS-path string matches the given regular expression. |
+| `match community "<value>"` | Matches routes carrying the specified BGP community string. |
+| `match any` | Matches all routes unconditionally. Used as a catch-all at the end of a policy. |
+
+#### set
+
+The `set` clause modifies an attribute of routes that match a `permit` stanza. It has no effect inside a `deny` stanza.
+
+| Expression | Description |
+|---|---|
+| `set local-pref <N>` | Sets the BGP local preference. Higher values are preferred. Used to influence outbound path selection within an AS. |
+| `set metric <N>` | Sets the route metric (MED in BGP). Lower values are preferred by the receiving AS. |
+
+#### if
+
+The `if` clause is an optional guard condition that further restricts when a stanza fires. It is evaluated after the `match` expression. If the condition is false, the stanza is skipped and evaluation continues to the next rank.
+
+Currently supported conditions:
+
+| Condition | Meaning |
+|---|---|
+| `if neighbor.state == LIVE` | Peer is active and in full session |
+| `if neighbor.state == DRAINED` | Peer is administratively drained |
+| `if neighbor.state == WARM` | Peer is in warm standby state |
+
+This is typically used to implement primary/backup path logic: allow a preferred route only when the primary peer is live, otherwise fall through to a lower-preference stanza.
+
+**Full example:**
 
 ```
 policy {
   define PREFER-PRIMARY {
     rank 10: permit {
-      match prefix 192.0.2.0/24 le 32
+      match prefix 192.168.0.0/16 le 24
       set local-pref 300
       if neighbor.state == LIVE
     }
@@ -343,13 +446,79 @@ policy {
 }
 ```
 
+Reading this policy: if the neighbor is live and the route falls within `192.168.0.0/16`, prefer it strongly (local-pref 300). If the neighbor is not live, or the route does not match that prefix, fall through to rank 20 and permit it with a weaker preference (local-pref 100). Finally, drop the default route entirely.
+
+---
+
 ### Intent Block
 
-Declares high-level traffic path intents.
+The intent block declares high-level traffic path requirements. Rather than specifying which interface to configure on which device, you declare where you want traffic to flow and under what constraints — RouterLang works out the per-device implications during config generation.
 
 ```
 intent {
-  MAIN-TRAFFIC: route datacenter {
+  <INTENT-NAME>: route <label> {
+    primary: <role> >> <role> >> <role>
+    backup:  <role> >> <role>
+    apply-policy: <POLICY-NAME>
+    fault-tolerance: <N>
+    scope: all
+  }
+}
+```
+
+Intent names use uppercase identifiers by convention. The `route` keyword introduces a routing intent; the `<label>` after it is a free-form identifier that names the traffic class (e.g. `backbone`, `datacenter`, `management`).
+
+#### primary and backup
+
+Path expressions describe the sequence of roles traffic must traverse, from ingress to egress. The `>>` operator separates consecutive hops.
+
+```
+primary: edge >> spine >> leaf
+backup:  edge >> leaf
+```
+
+The compiler validates every path against the topology:
+
+- Each role in the path must be declared in the topology block (E-10).
+- Every consecutive pair of roles in the path must be connected by a link (E-11).
+- The backup path must differ from the primary path (E-12).
+
+A path must contain at least two roles (a single-hop path is a syntax error). There is no upper limit on path length.
+
+The `backup` line is optional. If omitted, no fallback path is declared for this intent.
+
+#### apply-policy
+
+References a policy from the policy block by name. The named policy must exist — referencing an undefined policy is a semantic error (E-8). During config generation, the referenced policy is emitted as a route-map on every device involved in this intent.
+
+```
+apply-policy: PREFER-PRIMARY
+```
+
+#### fault-tolerance
+
+Declares the minimum number of edge-disjoint paths required between the endpoints of this intent. Must be 1 or greater — a value of 0 is a semantic error (E-13).
+
+```
+fault-tolerance: 2
+```
+
+A value of 2 means the network must support at least two independent paths, so that a single link failure does not interrupt traffic. This is validated logically; the compiler checks that a backup path exists when `fault-tolerance` is greater than 1.
+
+#### scope
+
+Controls which devices the intent configuration is written to. Use `all` to apply the intent to every device in the network, or list specific role names to restrict application.
+
+```
+scope: all
+scope: edge, spine
+```
+
+**Full example:**
+
+```
+intent {
+  CORE-TRAFFIC: route backbone {
     primary: edge >> spine >> leaf
     backup:  edge >> leaf
     apply-policy: PREFER-PRIMARY
@@ -359,84 +528,109 @@ intent {
 }
 ```
 
-### Transition Block
-
-Supports live network migration between topology states.
+Multiple intents can coexist in the same block, each with a unique name:
 
 ```
-transition {
-  from: spine-old
-  to:   spine-new
-  intermediate: spine-temp
+intent {
+  CORE-TRAFFIC: route backbone {
+    primary: edge >> spine >> leaf
+    backup:  edge >> leaf
+    apply-policy: PREFER-PRIMARY
+    fault-tolerance: 2
+    scope: all
+  }
+
+  MGMT-TRAFFIC: route management {
+    primary: edge >> spine
+    apply-policy: BLOCK-BOGONS
+    fault-tolerance: 1
+    scope: edge
+  }
 }
 ```
 
 ---
 
-## Grammar Complexity
+### Transition Block
 
-| Dimension | RouterLang | Required | Tier |
-|---|---|---|---|
-| Productions | 41 rules | 30+ | HIGH |
-| Recursion Depth | 6 levels | 3+ | HIGH |
-| Lexical Token Types | 38 tokens | 30+ | HIGH |
-| Syntactic Nesting | 6 levels | 5+ | HIGH |
-| Ambiguity | Fully unambiguous | — | BEST |
+The optional transition block describes a planned live migration from one topology state to another. It is placed at the end of the file, after the intent block.
 
----
+```
+transition {
+  from: <name>
+  to:   <name>
+  intermediate: <name>
+}
+```
 
-## Semantic Rules
+The three fields name the source topology, the target topology, and an intermediate state used during the cutover. These are free-form identifiers — they label the migration stages for documentation purposes.
 
-RouterLang enforces 14 semantic rules at compile time. Rules are checked by `SemanticCheckerListener` walking the ANTLR parse tree; errors and warnings are collected into a `diagnostics` list on the `SemanticChecker` object.
+```
+transition {
+  from: spine-v1
+  to:   spine-v2
+  intermediate: spine-hybrid
+}
+```
 
-| Code | Rule | Type |
-|---|---|---|
-| E-1 | Duplicate role name | Error |
-| E-2 | Role count = 0 | Error |
-| E-3 | Range lower > upper | Error |
-| E-4 | Link references undeclared role | Error |
-| W-5 | Duplicate link edge | Warning |
-| E-6 | Reflexive link (`r -- r`) | Error |
-| E-7 | Duplicate rank within same policy | Error |
-| E-8 | Intent references undefined policy | Error |
-| E-9 | Duplicate intent name | Error |
-| E-10 | Path references undeclared role | Error |
-| E-11 | No link between consecutive path roles | Error |
-| E-12 | Backup path identical to primary path | Error |
-| E-13 | `fault-tolerance: 0` on route intent | Error |
-| E-14 | ASN assigned to undeclared role | Error |
+This block is parsed and validated in the current release but does not yet influence config generation. It is intended for future support of incremental rollout planning.
 
 ---
 
-## Test Cases
+### Comments
 
-### Parser Tests (`test_parser.py`)
+RouterLang supports two comment styles:
 
-| # | Input | Expected | Result |
-|---|---|---|---|
-| 1 | Minimal valid program | ACCEPT | ✅ |
-| 2 | Empty routing block | REJECT | ✅ |
-| 3 | Single hop path | REJECT | ✅ |
-| 4 | Valid guard expression | ACCEPT | ✅ |
-| 5 | Explicit BGP peer list | ACCEPT | ✅ |
-| 6 | Prefix match with local-pref | ACCEPT | ✅ |
-| 7 | Multi-hop path with backup | ACCEPT | ✅ |
-| 8 | Deny then permit policy | ACCEPT | ✅ |
+```
+// This is a single-line comment
 
-### Semantic Tests (`src/compiler/semantic_checker.py`) — 30/30
+/* This is a
+   block comment */
+```
 
-| Group | Tests | Coverage |
-|---|---|---|
-| Topology | T-01 → T-09b | E-1, E-2, E-3, E-4, E-6, W-5 |
-| Routing / ASN | R-01 → R-02 | E-14 |
-| Policy | P-01 → P-03 | E-7 |
-| Path expressions | X-01 → X-04 | E-10, E-11 |
-| Intent declarations | I-01 → I-06 | E-8, E-9, E-12, E-13 |
-| Integration (ANTLR) | A-01 → A-05 | Full pipeline via parse tree |
+Comments can appear anywhere whitespace is allowed. They are stripped during lexing and have no effect on compilation.
 
 ---
 
-## Example Program
+### Identifiers and Naming Rules
+
+Identifiers in RouterLang follow this pattern: they must start with a letter (`a-z`, `A-Z`) and may be followed by any combination of letters, digits, underscores (`_`), and hyphens (`-`).
+
+Valid: `spine`, `R-LEAF-1`, `PREFER-PRIMARY`, `area_core`, `bgp-peer-01`
+
+Invalid: `1spine` (starts with digit), `spine leaf` (contains space), `spine.leaf` (contains dot outside a guard expression)
+
+Policy names are conventionally written in `UPPER-KEBAB-CASE`. Role names are conventionally written in `lower-kebab-case`. Device names typically follow your organisation's existing hostname convention.
+
+---
+
+### Common Mistakes
+
+**Referencing a role before declaring it**
+
+All roles must be declared in the `roles` section of the topology block before they can be used in links, ASN assignments, OSPF areas, or path expressions.
+
+**Declaring a link between roles with no path in the intent**
+
+A link in the topology block does not automatically create a path in an intent. Paths must be declared explicitly in the intent block, and every hop in the path must have a corresponding link.
+
+**Using a reserved keyword as a role name**
+
+Names like `all`, `border`, `route`, `area`, and `scope` are reserved. Using them as role names produces a parse error.
+
+**Forgetting the backup path with fault-tolerance > 1**
+
+If `fault-tolerance: 2` is declared but no `backup` path is provided, the intent cannot be satisfied. The compiler will flag this.
+
+**Omitting a policy that is referenced by an intent**
+
+The policy must be defined before the intent block is compiled. If `apply-policy: MY-POLICY` is present in an intent but `MY-POLICY` is not defined in the policy block, this is a semantic error (E-8).
+
+---
+
+## A Complete Example
+
+Save the following as `my_network.rl` and run `python main.py my_network.rl --generate`.
 
 ```
 topology {
@@ -450,60 +644,117 @@ topology {
     spine -- edge  { weight: 2 }
     edge  -- leaf  { weight: 3 }
   }
+  devices {
+    spine: [R-SPINE-1, R-SPINE-2]
+    leaf:  [R-LEAF-1, R-LEAF-2, R-LEAF-3, R-LEAF-4]
+    edge:  [R-EDGE-1, R-EDGE-2]
+  }
 }
+
 routing {
   bgp {
-    asn { spine: 65001  leaf: 65002  edge: 65003 }
+    asn {
+      spine: 65001
+      leaf:  65002
+      edge:  65003
+    }
     neighbors: auto
+    route-reflector: spine
+  }
+  ospf {
+    area 0 { roles: [spine, leaf] }
+    area 1 { roles: [edge] }
   }
 }
+
 policy {
-  define MAIN-POLICY {
+  define PREFER-PRIMARY {
     rank 10: permit {
-      match prefix 10.0.0.0/8 le 24
-      set local-pref 200
+      match prefix 192.168.0.0/16 le 24
+      set local-pref 300
       if neighbor.state == LIVE
     }
-    rank 20: deny {
+    rank 20: permit {
       match any
+      set local-pref 100
+    }
+    rank 30: deny {
+      match prefix 0.0.0.0/0 le 32
     }
   }
 }
+
 intent {
   CORE-TRAFFIC: route backbone {
     primary: edge >> spine >> leaf
     backup:  edge >> leaf
-    apply-policy: MAIN-POLICY
-    fault-tolerance: 1
+    apply-policy: PREFER-PRIMARY
+    fault-tolerance: 2
     scope: all
   }
 }
 ```
 
+This produces eight files under `output/my_network/`:
+
+```
+R-SPINE-1.cfg    R-SPINE-2.cfg
+R-LEAF-1.cfg     R-LEAF-2.cfg     R-LEAF-3.cfg     R-LEAF-4.cfg
+R-EDGE-1.cfg     R-EDGE-2.cfg
+```
+
+Each file contains the hostname declaration, OSPF process configuration, BGP session configuration with all adjacent-role peers, route-map stubs derived from the policy block, and informational comments describing the intents.
+
 ---
 
-## Weekly Progress
+## Semantic Rules
 
-| Week | Deliverable | Status |
+RouterLang enforces 14 rules at compile time. All errors must be resolved before a configuration can be generated. Warnings are reported but do not block generation.
+
+| Code | Rule | Severity |
 |---|---|---|
-| 1–2 | Domain analysis — ISP backbone routing DSL scope | ✅ Complete |
-| 3–4 | Initial grammar — BNF skeleton, lexical tokens | ✅ Complete |
-| 5 | Full grammar — 41 productions, 38 tokens | ✅ Complete |
-| 6 | Grammar refinement, semantics, derivation trees | ✅ Complete |
-| 7 | ANTLR parser implementation, parser test suite | ✅ Complete |
-| 8 | Lexical analyzer with coloured output and summary | ✅ Complete |
-| 9 | Symbol table builder (roles, links, devices, policies, intents) | ✅ Complete |
-| 10 | Semantic checker — 14 rules, ANTLR listener, 30/30 tests | ✅ Complete |
+| E-1 | Duplicate role name | Error |
+| E-2 | Role count equals zero | Error |
+| E-3 | Count range has lower bound greater than upper bound | Error |
+| E-4 | Link references an undeclared role | Error |
+| W-5 | Duplicate link between the same two roles | Warning |
+| E-6 | Reflexive link — a role linked to itself | Error |
+| E-7 | Duplicate rank within the same policy | Error |
+| E-8 | Intent references an undefined policy | Error |
+| E-9 | Duplicate intent name | Error |
+| E-10 | Path expression references an undeclared role | Error |
+| E-11 | Consecutive roles in a path have no connecting link | Error |
+| E-12 | Backup path is identical to the primary path | Error |
+| E-13 | `fault-tolerance` set to zero on a route intent | Error |
+| E-14 | BGP ASN assigned to an undeclared role | Error |
+
+---
+
+## Config Generation
+
+When all four validation stages pass, `--generate` produces Cisco IOS-style configuration files. Each file includes:
+
+**hostname** — The device name as declared in the `devices` section.
+
+**OSPF** — A `router ospf 1` block with a deterministic router ID and the correct area assignment for that device's role.
+
+**BGP** — A `router bgp <ASN>` block with one `neighbor` entry per peer device in all adjacent roles. Each neighbor entry includes `remote-as`, `description`, and `update-source Loopback0`. Route-reflector devices additionally include `bgp cluster-id 1` and `route-reflector-client` per peer.
+
+**Route-maps** — One `route-map` block per policy defined in the source, with a numbered sequence entry per rank. The sequence entries include comment stubs indicating where match and set clauses should be filled in for the target platform.
+
+**Intent comments** — Human-readable annotations at the end of the file describing the primary path, backup path, applied policy, and fault-tolerance requirement for each declared intent.
+
+Router IDs and peer IP addresses are derived deterministically from device names when no explicit IP addresses are provided in the source. Generated files should be reviewed by a network engineer before being applied to any live device.
 
 ---
 
 ## Authors
 
-- **Eftode Andrei** — *FAF-242 / TUM*
-- **Biriucov Alexandru** — *FAF-242 / TUM*
-- **Sitarciuc Dmitri** — *FAF-242 / TUM*
-- **Strunga Daniel-Ioan** — *FAF-242 / TUM*
+| Name | Programme |
+|---|---|
+| Eftode Andrei | FAF-242, Technical University of Moldova |
+| Biriucov Alexandru | FAF-242, Technical University of Moldova |
+| Sitarciuc Dmitri | FAF-242, Technical University of Moldova |
+| Strunga Daniel-Ioan | FAF-242, Technical University of Moldova |
 
-## License
-
-This project is developed as part of the Formal Languages and Compiler Design course at the Technical University of Moldova.
+Developed as part of the Formal Languages and Compiler Design course at the Technical University of Moldova.
