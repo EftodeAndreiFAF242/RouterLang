@@ -2,13 +2,15 @@
 RouterLang — Main Runner
 ========================
 Single entry point that runs a .rl file through the full pipeline:
-    Lexer  →  Parser  →  Symbol Table  →  Semantic Checker  →  Result
+    Lexer  →  Parser  →  Symbol Table  →  Semantic Checker  →  [Config Generator]
 
 Usage:
     python main.py <file.rl>                  # full pipeline
     python main.py <file.rl> --tokens         # also print token stream
     python main.py <file.rl> --symbols        # also print symbol table
     python main.py <file.rl> --verbose        # full detail on all stages
+    python main.py <file.rl> --generate       # also emit per-device .cfg files
+    python main.py <file.rl> --generate --out-dir ./my-configs
     python main.py --example                  # run built-in example and exit
 """
 
@@ -150,7 +152,7 @@ def run_lexer(source, show_tokens=False):
     stream = CommonTokenStream(lexer)
     stream.fill()
 
-    tokens = [t for t in stream.tokens if t.type != -1]  # exclude EOF
+    tokens = [t for t in stream.tokens if t.type != -1]
     visible = [t for t in tokens if t.channel == 0]
 
     keywords_found = set()
@@ -192,18 +194,8 @@ def run_lexer(source, show_tokens=False):
 
 # ── Stage 2: Parser ────────────────────────────────────────────────────────────
 
-class ErrorCollector:
-    def __init__(self):
-        self.errors = []
-    def syntaxError(self, recognizer, offendingSymbol, line, column, msg, e):
-        self.errors.append((line, column, msg))
-    def reportAmbiguity(self, *a): pass
-    def reportAttemptingFullContext(self, *a): pass
-    def reportContextSensitivity(self, *a): pass
-
 def run_parser(source):
     section("STAGE 2 — Parser")
-    from antlr4 import DiagnosticErrorListener
     from antlr4.error.ErrorListener import ErrorListener
 
     class CE(ErrorListener):
@@ -247,13 +239,11 @@ def run_symbol_table(source, show_symbols=False):
     try:
         st = build_symbol_table(source)
     except AttributeError as e:
-        # Grammar/symbol-table version mismatch — extract what we can from semantic checker
         warn(f"Symbol table builder has a grammar mismatch ({e})")
         warn("Falling back to semantic checker's internal symbol data")
         checker = analyze(source)
-        # Show what semantic checker knows about the program
         _show_summary_from_semantic(checker)
-        return None, True   # non-fatal — semantic stage will re-validate
+        return None, True
     except Exception as e:
         fail(f"Symbol table error: {e}")
         return None, False
@@ -282,9 +272,6 @@ def run_symbol_table(source, show_symbols=False):
 
 
 def _show_summary_from_semantic(checker):
-    """Extract and display key symbol info from the semantic checker's internal state."""
-    # The SemanticCheckerListener populates checker._roles, _links, _policies etc.
-    # Access whatever attributes exist
     for attr in ["_roles", "roles"]:
         roles = getattr(checker, attr, None)
         if roles:
@@ -321,23 +308,54 @@ def run_semantic(source):
 
     return checker, len(errors) == 0
 
+# ── Stage 5: Config Generator ──────────────────────────────────────────────────
+
+def run_config_generator(source, filename, out_dir):
+    section("STAGE 5 — Config Generation")
+    try:
+        from config_generator import generate_configs
+    except ImportError as e:
+        fail(f"Config generator not available: {e}")
+        return [], False
+
+    try:
+        written = generate_configs(source, filename, out_dir)
+    except Exception as e:
+        fail(f"Config generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return [], False
+
+    if not written:
+        warn("No config files were generated (no devices or roles found?)")
+        return [], False
+
+    ok(f"Generated {len(written)} config file(s) → '{out_dir}/'")
+    for path in written:
+        info(path)
+    return written, True
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 
-def print_summary(source, stages, elapsed):
+def print_summary(source, stages, stage_names, elapsed, generated_files=None):
     section("SUMMARY")
 
-    names  = ["Lexer", "Parser", "Symbol Table", "Semantic"]
     passed = all(stages)
 
-    for name, ok_flag in zip(names, stages):
+    for name, ok_flag in zip(stage_names, stages):
         sym = f"{GREEN}PASS{RESET}" if ok_flag else f"{RED}FAIL{RESET}"
-        print(f"  {BOLD}{name:<16}{RESET}  {sym}")
+        print(f"  {BOLD}{name:<22}{RESET}  {sym}")
 
     lines = source.count("\n") + 1
     print(f"\n  {GREY}Source lines : {lines}{RESET}")
     print(f"  {GREY}Time elapsed : {elapsed*1000:.1f} ms{RESET}")
-    print()
 
+    if generated_files:
+        print(f"\n  {BOLD}{CYAN}Generated config files:{RESET}")
+        for p in generated_files:
+            print(f"  {GREEN}  {p}{RESET}")
+
+    print()
     if passed:
         print(f"  {BOLD}{GREEN}✅  Configuration VALID — ready for deployment review.{RESET}")
     else:
@@ -350,11 +368,19 @@ def main():
     parser = argparse.ArgumentParser(
         description="RouterLang — compile and validate a .rl network configuration file"
     )
-    parser.add_argument("file", nargs="?", help="Path to a .rl source file")
+    parser.add_argument("file",      nargs="?", help="Path to a .rl source file")
     parser.add_argument("--tokens",  action="store_true", help="Print token stream (stage 1)")
     parser.add_argument("--symbols", action="store_true", help="Print symbol table (stage 3)")
     parser.add_argument("--verbose", action="store_true", help="Enable --tokens and --symbols")
     parser.add_argument("--example", action="store_true", help="Run built-in ISP backbone example")
+    parser.add_argument(
+        "--generate", action="store_true",
+        help="Generate per-device router config files (.cfg) after validation"
+    )
+    parser.add_argument(
+        "--out-dir", default="",
+        help="Output directory for generated configs (default: ./output/<filename>/)"
+    )
     args = parser.parse_args()
 
     show_tokens  = args.tokens  or args.verbose
@@ -363,6 +389,7 @@ def main():
     if args.example:
         source   = EXAMPLE_SOURCE
         filename = "<built-in ISP backbone example>"
+        basename = "example"
     elif args.file:
         if not os.path.isfile(args.file):
             print(f"{RED}Error: file not found: {args.file}{RESET}")
@@ -370,11 +397,12 @@ def main():
         with open(args.file, "r", encoding="utf-8") as f:
             source = f.read()
         filename = args.file
+        basename = os.path.splitext(os.path.basename(args.file))[0]
     else:
         parser.print_help()
         sys.exit(0)
 
-    banner(f"RouterLang Compiler")
+    banner("RouterLang Compiler")
     print(f"\n  {GREY}File   : {filename}{RESET}")
     print(f"  {GREY}Lines  : {source.count(chr(10))+1}{RESET}")
 
@@ -385,10 +413,25 @@ def main():
     st, ok3 = run_symbol_table(source, show_symbols)
     _,  ok4 = run_semantic(source)
 
-    elapsed = time.time() - t0
-    print_summary(source, [ok1, ok2, ok3, ok4], elapsed)
+    generated_files = []
+    stage_names     = ["Lexer", "Parser", "Symbol Table", "Semantic"]
+    all_stages      = [ok1, ok2, ok3, ok4]
 
-    sys.exit(0 if all([ok1, ok2, ok3, ok4]) else 1)
+    if args.generate:
+        stage_names.append("Config Generation")
+        if all([ok1, ok2, ok3, ok4]):
+            out_dir = args.out_dir or os.path.join("output", basename)
+            files, ok5 = run_config_generator(source, filename, out_dir)
+            generated_files = files
+            all_stages.append(ok5)
+        else:
+            warn("Skipping config generation — fix validation errors first.")
+            all_stages.append(False)
+
+    elapsed = time.time() - t0
+    print_summary(source, all_stages, stage_names, elapsed, generated_files)
+
+    sys.exit(0 if all(all_stages) else 1)
 
 
 if __name__ == "__main__":
