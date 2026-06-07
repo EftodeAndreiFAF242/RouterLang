@@ -115,7 +115,7 @@ def section(title):
     print(f"\n{BOLD}{WHITE}── {title} {'─' * (56 - len(title))}{RESET}")
 
 def ok(msg):
-    print(f"  {GREEN}✅  {msg}{RESET}")
+    print(f"  {GREEN}   {msg}{RESET}")
 
 def fail(msg):
     print(f"  {RED}✗  {msg}{RESET}")
@@ -357,7 +357,7 @@ def print_summary(source, stages, stage_names, elapsed, generated_files=None):
 
     print()
     if passed:
-        print(f"  {BOLD}{GREEN}✅  Configuration VALID — ready for deployment review.{RESET}")
+        print(f"  {BOLD}{GREEN}   Configuration VALID — ready for deployment review.{RESET}")
     else:
         print(f"  {BOLD}{RED}✗   Configuration INVALID — fix errors before deploying.{RESET}")
     print()
