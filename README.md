@@ -76,7 +76,7 @@ RouterLang/
 │   └── compiler/
 │       ├── symbol_table.py            # Symbol table builder
 │       ├── semantic_checker.py        # 14-rule semantic analyser
-│       └── config_generator.py        # Per-device .cfg file generator
+│       └── config_generator.py        # Per-device config generator (cisco / junos / openconfig)
 │
 ├── tests/
 │   ├── valid/
@@ -137,18 +137,32 @@ python main.py my_network.rl
 python main.py my_network.rl --generate
 ```
 
-Configuration files are written to `./output/my_network/` by default — one `.cfg` per device declared in the source.
+Configuration files are written to `./output/my_network/` by default — one file per device declared in the source.
+
+### Generate for a specific vendor
+
+RouterLang supports three output formats. Use the `--vendor` flag to select the target:
+
+```bash
+python main.py my_network.rl --generate --vendor cisco       # Cisco IOS CLI  (default, .cfg)
+python main.py my_network.rl --generate --vendor junos       # JunOS hierarchical CLI  (.conf)
+python main.py my_network.rl --generate --vendor openconfig  # OpenConfig JSON  (.json)
+```
+
+The same `.rl` source file works for all three vendors — no changes to the source are needed when switching targets.
 
 ### Specify a custom output directory
 
 ```bash
 python main.py my_network.rl --generate --out-dir ./configs/production
+python main.py my_network.rl --generate --vendor junos --out-dir ./configs/junos
 ```
 
 ### Run the built-in example
 
 ```bash
 python main.py --example --generate
+python main.py --example --generate --vendor openconfig
 ```
 
 ### Additional flags
@@ -158,7 +172,8 @@ python main.py --example --generate
 | `--tokens` | Print the full token stream after lexing |
 | `--symbols` | Print the symbol table after parsing |
 | `--verbose` | Enable both `--tokens` and `--symbols` |
-| `--generate` | Run Stage 5 and emit `.cfg` files |
+| `--generate` | Run Stage 5 and emit config files |
+| `--vendor <name>` | Target vendor syntax: `cisco` (default), `junos`, `openconfig` |
 | `--out-dir <path>` | Set output directory for generated configs |
 
 ---
@@ -695,12 +710,19 @@ intent {
 }
 ```
 
-This produces eight files under `output/my_network/`:
+This produces eight files under `output/my_network/` (Cisco IOS by default):
 
 ```
 R-SPINE-1.cfg    R-SPINE-2.cfg
 R-LEAF-1.cfg     R-LEAF-2.cfg     R-LEAF-3.cfg     R-LEAF-4.cfg
 R-EDGE-1.cfg     R-EDGE-2.cfg
+```
+
+To generate the same topology in JunOS or OpenConfig format, add the `--vendor` flag — no changes to the `.rl` file are needed:
+
+```bash
+python main.py my_network.rl --generate --vendor junos       # produces .conf files
+python main.py my_network.rl --generate --vendor openconfig  # produces .json files
 ```
 
 Each file contains the hostname declaration, OSPF process configuration, BGP session configuration with all adjacent-role peers, route-map stubs derived from the policy block, and informational comments describing the intents.
@@ -732,7 +754,11 @@ RouterLang enforces 14 rules at compile time. All errors must be resolved before
 
 ## Config Generation
 
-When all four validation stages pass, `--generate` produces Cisco IOS-style configuration files. Each file includes:
+When all four validation stages pass, `--generate` produces per-device configuration files. The output format depends on the `--vendor` flag.
+
+### Cisco IOS (default)
+
+Produces `.cfg` files using Cisco IOS CLI syntax. Each file includes:
 
 **hostname** — The device name as declared in the `devices` section.
 
@@ -740,9 +766,53 @@ When all four validation stages pass, `--generate` produces Cisco IOS-style conf
 
 **BGP** — A `router bgp <ASN>` block with one `neighbor` entry per peer device in all adjacent roles. Each neighbor entry includes `remote-as`, `description`, and `update-source Loopback0`. Route-reflector devices additionally include `bgp cluster-id 1` and `route-reflector-client` per peer.
 
-**Route-maps** — One `route-map` block per policy defined in the source, with a numbered sequence entry per rank. The sequence entries include comment stubs indicating where match and set clauses should be filled in for the target platform.
+**Route-maps** — One `route-map` block per policy defined in the source, with a numbered sequence entry per rank. Prefix lists are generated from `match prefix` clauses. `set local-preference` is emitted where declared.
 
 **Intent comments** — Human-readable annotations at the end of the file describing the primary path, backup path, applied policy, and fault-tolerance requirement for each declared intent.
+
+---
+
+### JunOS (`--vendor junos`)
+
+Produces `.conf` files using JunOS hierarchical set-style CLI syntax. Each file includes:
+
+**system** — A `system { host-name ... }` block with the device hostname and role annotation.
+
+**protocols ospf** — A `protocols { ospf { ... } }` block with router ID and area assignments.
+
+**protocols bgp** — A `protocols { bgp { ... } }` block with one `group` per peer device, typed as `internal` or `external` based on ASN comparison, with optional `cluster` configuration for route-reflector roles.
+
+**policy-options** — Named `prefix-list` blocks derived from `match prefix` clauses, followed by a `policy-statement` block per policy with `term` entries mapping to each rank. Actions use JunOS `accept` / `reject` syntax and `local-preference`.
+
+**Intent comments** — Block comments at the end of the file describing path and policy annotations.
+
+---
+
+### OpenConfig (`--vendor openconfig`)
+
+Produces `.json` files structured according to OpenConfig YANG models (RFC 7951 encoding). Each file includes:
+
+**openconfig-system:system** — Hostname configuration.
+
+**openconfig-bgp:bgp** — Global ASN and router ID, plus a `neighbors` list with per-peer address, `peer-as`, description, transport, and route-reflector configuration.
+
+**openconfig-ospfv2:ospfv2** — Router ID and area assignments with interface bindings.
+
+**openconfig-routing-policy:routing-policy** — Policy definitions with `policy-definition` entries, each containing `statement` items that map ranks to match conditions (`match-prefix-set`) and actions (`ACCEPT_ROUTE` / `REJECT_ROUTE`, `set-local-pref`).
+
+**_routerlang_intents** — A metadata array documenting the declared intents, paths, policy references, and fault-tolerance values for each intent.
+
+This format can be pushed directly to devices that support NETCONF or RESTCONF with OpenConfig models loaded.
+
+---
+
+### Output file extensions by vendor
+
+| Vendor | Flag | Extension |
+|---|---|---|
+| Cisco IOS | `--vendor cisco` | `.cfg` |
+| JunOS | `--vendor junos` | `.conf` |
+| OpenConfig | `--vendor openconfig` | `.json` |
 
 Router IDs and peer IP addresses are derived deterministically from device names when no explicit IP addresses are provided in the source. Generated files should be reviewed by a network engineer before being applied to any live device.
 
