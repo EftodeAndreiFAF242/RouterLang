@@ -5,13 +5,15 @@ Single entry point that runs a .rl file through the full pipeline:
     Lexer  →  Parser  →  Symbol Table  →  Semantic Checker  →  [Config Generator]
 
 Usage:
-    python main.py <file.rl>                  # full pipeline
-    python main.py <file.rl> --tokens         # also print token stream
-    python main.py <file.rl> --symbols        # also print symbol table
-    python main.py <file.rl> --verbose        # full detail on all stages
-    python main.py <file.rl> --generate       # also emit per-device .cfg files
+    python main.py <file.rl>                          # full pipeline
+    python main.py <file.rl> --tokens                 # also print token stream
+    python main.py <file.rl> --symbols                # also print symbol table
+    python main.py <file.rl> --verbose                # full detail on all stages
+    python main.py <file.rl> --generate               # emit per-device .cfg files (Cisco IOS)
+    python main.py <file.rl> --generate --vendor junos
+    python main.py <file.rl> --generate --vendor openconfig
     python main.py <file.rl> --generate --out-dir ./my-configs
-    python main.py --example                  # run built-in example and exit
+    python main.py --example                          # run built-in example and exit
 """
 
 import sys
@@ -310,16 +312,21 @@ def run_semantic(source):
 
 # ── Stage 5: Config Generator ──────────────────────────────────────────────────
 
-def run_config_generator(source, filename, out_dir):
+def run_config_generator(source, filename, out_dir, vendor="cisco"):
     section("STAGE 5 — Config Generation")
     try:
-        from config_generator import generate_configs
+        from config_generator import generate_configs, SUPPORTED_VENDORS
     except ImportError as e:
         fail(f"Config generator not available: {e}")
         return [], False
 
+    info(f"Vendor target  : {vendor}")
+
     try:
-        written = generate_configs(source, filename, out_dir)
+        written = generate_configs(source, filename, out_dir, vendor=vendor)
+    except ValueError as e:
+        fail(str(e))
+        return [], False
     except Exception as e:
         fail(f"Config generation failed: {e}")
         import traceback
@@ -337,7 +344,7 @@ def run_config_generator(source, filename, out_dir):
 
 # ── Summary ────────────────────────────────────────────────────────────────────
 
-def print_summary(source, stages, stage_names, elapsed, generated_files=None):
+def print_summary(source, stages, stage_names, elapsed, generated_files=None, vendor=None):
     section("SUMMARY")
 
     passed = all(stages)
@@ -349,6 +356,8 @@ def print_summary(source, stages, stage_names, elapsed, generated_files=None):
     lines = source.count("\n") + 1
     print(f"\n  {GREY}Source lines : {lines}{RESET}")
     print(f"  {GREY}Time elapsed : {elapsed*1000:.1f} ms{RESET}")
+    if vendor:
+        print(f"  {GREY}Vendor target: {vendor}{RESET}")
 
     if generated_files:
         print(f"\n  {BOLD}{CYAN}Generated config files:{RESET}")
@@ -375,7 +384,18 @@ def main():
     parser.add_argument("--example", action="store_true", help="Run built-in ISP backbone example")
     parser.add_argument(
         "--generate", action="store_true",
-        help="Generate per-device router config files (.cfg) after validation"
+        help="Generate per-device router config files after validation"
+    )
+    parser.add_argument(
+        "--vendor",
+        default="cisco",
+        choices=["cisco", "junos", "openconfig"],
+        help=(
+            "Target vendor syntax for --generate. "
+            "cisco  = Cisco IOS CLI  (default, .cfg files)  "
+            "junos  = JunOS hierarchical CLI  (.conf files)  "
+            "openconfig = OpenConfig JSON  (.json files)"
+        ),
     )
     parser.add_argument(
         "--out-dir", default="",
@@ -405,6 +425,8 @@ def main():
     banner("RouterLang Compiler")
     print(f"\n  {GREY}File   : {filename}{RESET}")
     print(f"  {GREY}Lines  : {source.count(chr(10))+1}{RESET}")
+    if args.generate:
+        print(f"  {GREY}Vendor : {args.vendor}{RESET}")
 
     t0 = time.time()
 
@@ -421,7 +443,9 @@ def main():
         stage_names.append("Config Generation")
         if all([ok1, ok2, ok3, ok4]):
             out_dir = args.out_dir or os.path.join("output", basename)
-            files, ok5 = run_config_generator(source, filename, out_dir)
+            files, ok5 = run_config_generator(
+                source, filename, out_dir, vendor=args.vendor
+            )
             generated_files = files
             all_stages.append(ok5)
         else:
@@ -429,7 +453,11 @@ def main():
             all_stages.append(False)
 
     elapsed = time.time() - t0
-    print_summary(source, all_stages, stage_names, elapsed, generated_files)
+    print_summary(
+        source, all_stages, stage_names, elapsed,
+        generated_files,
+        vendor=args.vendor if args.generate else None,
+    )
 
     sys.exit(0 if all(all_stages) else 1)
 

@@ -1,8 +1,12 @@
 """
 RouterLang Config Generator
 ============================
-Translates a .rl source file into per-device router configuration files
-(Cisco IOS-style).
+Translates a .rl source file into per-device router configuration files.
+
+Supported vendors (--vendor flag in main.py):
+    cisco      Cisco IOS-style CLI  (default)
+    junos      JunOS hierarchical CLI (set-style)
+    openconfig OpenConfig JSON (RFC 7951)
 
 This module does NOT rely on symbol_table.py or semantic_checker.py.
 It parses the ANTLR tree directly with its own lightweight listener,
@@ -17,15 +21,18 @@ Output files are written to a directory chosen by the caller.
 Usage (standalone):
     python src/compiler/config_generator.py my_network.rl
     python src/compiler/config_generator.py my_network.rl --out-dir ./configs
+    python src/compiler/config_generator.py my_network.rl --vendor junos
+    python src/compiler/config_generator.py my_network.rl --vendor openconfig
 
 Usage (from main.py via --generate flag):
     python main.py my_network.rl --generate
-    python main.py my_network.rl --generate --out-dir ./configs
+    python main.py my_network.rl --generate --vendor junos
+    python main.py my_network.rl --generate --vendor openconfig --out-dir ./configs
 """
 
 import os
 import sys
-import textwrap
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -52,9 +59,19 @@ class LinkInfo:
     weight: int = 1
 
 @dataclass
+class PolicyStanzaInfo:
+    rank:    Optional[int]
+    action:  str           # "permit" or "deny"
+    prefix:  Optional[str] = None
+    le:      Optional[int] = None
+    match_any: bool        = False
+    local_pref: Optional[int] = None
+
+@dataclass
 class PolicyInfo:
-    name:  str
-    ranks: list = field(default_factory=list)   # list of int
+    name:     str
+    ranks:    list = field(default_factory=list)       # list of int
+    stanzas:  list = field(default_factory=list)       # list of PolicyStanzaInfo
 
 @dataclass
 class IntentInfo:
@@ -96,8 +113,6 @@ def _parse_network(source: str) -> NetworkModel:
         # -- topology / roles
         def enterRoleDecl(self, ctx):
             name = ctx.IDENT().getText()
-            # Grammar: roleDecl : IDENT '{' 'count' ':' intRange '}'
-            # intRange : INT ('..' INT)?
             ints = [int(t.getText()) for t in ctx.intRange().INT()]
             count = max(ints) if ints else 1
             model.roles[name] = RoleInfo(name=name, count=count)
@@ -138,12 +153,50 @@ def _parse_network(source: str) -> NetworkModel:
         # -- policy
         def enterPolicyDef(self, ctx):
             pol_name = ctx.IDENT().getText()
-            ranks = []
+            ranks    = []
+            stanzas  = []
             for stanza in ctx.policyStanza():
+                rank = None
                 rc = stanza.rankClause()
                 if rc:
-                    ranks.append(int(rc.INT().getText()))
-            model.policies.append(PolicyInfo(name=pol_name, ranks=ranks))
+                    rank = int(rc.INT().getText())
+                    ranks.append(rank)
+
+                action = "permit"
+                ak = stanza.actionKw()
+                if ak:
+                    action = ak.getText()
+
+                prefix     = None
+                le_val     = None
+                match_any  = False
+                local_pref = None
+
+                for mc in stanza.matchClause():
+                    me = mc.matchExpr()
+                    if me.getText() == "any":
+                        match_any = True
+                    elif me.prefixExpr():
+                        pe = me.prefixExpr()
+                        prefix = pe.CIDR().getText() if pe.CIDR() else None
+                        if pe.INT():
+                            le_val = int(pe.INT().getText())
+
+                for sc in stanza.setClause():
+                    se = sc.setExpr()
+                    if se.KW_LOCAL_PREF() and se.INT():
+                        local_pref = int(se.INT().getText())
+
+                stanzas.append(PolicyStanzaInfo(
+                    rank=rank,
+                    action=action,
+                    prefix=prefix,
+                    le=le_val,
+                    match_any=match_any,
+                    local_pref=local_pref,
+                ))
+
+            model.policies.append(PolicyInfo(name=pol_name, ranks=ranks, stanzas=stanzas))
 
         # -- intent
         def enterIntentDecl(self, ctx):
@@ -178,7 +231,7 @@ def _parse_network(source: str) -> NetworkModel:
     lexer   = RouterLangLexer(input_stream)
     stream  = CommonTokenStream(lexer)
     parser  = RouterLangParser(stream)
-    parser.removeErrorListeners()   # suppress noise; main.py already validated
+    parser.removeErrorListeners()
     tree    = parser.program()
 
     ParseTreeWalker.DEFAULT.walk(Collector(), tree)
@@ -202,10 +255,30 @@ class DeviceConfig:
 
 
 # ===============================================================================
-# Config Generator
+# Helpers
+# ===============================================================================
+
+def _stable_id(name: str, mod: int = 253) -> int:
+    """Deterministic 1..mod integer from a device name (for router-ids / IPs)."""
+    h = 0
+    for ch in name:
+        h = (h * 31 + ord(ch)) & 0xFFFF
+    return (h % mod) + 1
+
+
+def _stable_ip(hostname: str) -> str:
+    """Deterministic loopback-style IP (10.0.0.x) for a device."""
+    return f"10.0.0.{_stable_id(hostname)}"
+
+
+# ===============================================================================
+# Base Config Generator  (vendor-neutral scaffold)
 # ===============================================================================
 
 class ConfigGenerator:
+
+    VENDOR = "cisco"   # overridden by subclasses
+    EXT    = ".cfg"
 
     def __init__(self, model: NetworkModel, source_name: str = ""):
         self.model       = model
@@ -221,34 +294,31 @@ class ConfigGenerator:
         return configs
 
     def write(self, out_dir: str) -> list:
-        """Write all .cfg files to out_dir.  Returns sorted list of paths."""
+        """Write all config files to out_dir.  Returns sorted list of paths."""
         os.makedirs(out_dir, exist_ok=True)
         written = []
         for hostname, text in self.generate().items():
             safe = hostname.replace("/", "_").replace("\\", "_")
-            path = os.path.join(out_dir, f"{safe}.cfg")
+            path = os.path.join(out_dir, f"{safe}{self.EXT}")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
             written.append(path)
         return sorted(written)
 
-    # -- build per-device configs
+    # -- build per-device configs (shared across all vendors)
 
     def _build_device_configs(self) -> list:
         m = self.model
 
-        # role -> [device_names]
         role_to_devs = {}
         if m.devices:
             for dev_name, role_name in m.devices.items():
                 role_to_devs.setdefault(role_name, []).append(dev_name)
         else:
-            # synthesise from role counts
             for role_name, ri in m.roles.items():
                 devs = [f"R-{role_name.upper()}-{i}" for i in range(1, ri.count + 1)]
                 role_to_devs[role_name] = devs
 
-        # role -> [ospf_area_ids]
         role_to_areas = {}
         for area_id, roles in m.ospf_areas.items():
             for r in roles:
@@ -287,7 +357,18 @@ class ConfigGenerator:
                 peers.append((peer_dev, adj_asn))
         return peers
 
-    # -- rendering
+    def _render(self, dc: DeviceConfig) -> str:
+        raise NotImplementedError
+
+
+# ===============================================================================
+# Cisco IOS Generator  (original behaviour preserved exactly)
+# ===============================================================================
+
+class CiscoConfigGenerator(ConfigGenerator):
+
+    VENDOR = "cisco"
+    EXT    = ".cfg"
 
     def _render(self, dc: DeviceConfig) -> str:
         parts = [self._header(dc), self._hostname(dc)]
@@ -307,7 +388,7 @@ class ConfigGenerator:
         src = self.source_name or "RouterLang"
         return (
             f"! {'=' * 58}\n"
-            f"! Auto-generated by RouterLang\n"
+            f"! Auto-generated by RouterLang  [vendor: cisco]\n"
             f"! Source    : {src}\n"
             f"! Device    : {dc.hostname}\n"
             f"! Role      : {dc.role}\n"
@@ -363,11 +444,17 @@ class ConfigGenerator:
         lines = ["!", "! -- Route-maps " + "-" * 42]
         for pol in dc.policies:
             seq = 10
-            for rank in sorted(pol.ranks):
-                lines += [
-                    f"route-map {pol.name} permit {seq}",
-                    f"  ! rank {rank} -- add match/set clauses here",
-                ]
+            for stanza in pol.stanzas:
+                action = "permit" if stanza.action == "permit" else "deny"
+                lines.append(f"route-map {pol.name} {action} {seq}")
+                if stanza.prefix:
+                    le_str = f" le {stanza.le}" if stanza.le else ""
+                    lines.append(f"  match ip address prefix-list PL-{pol.name}-{seq}")
+                    lines.append(f"ip prefix-list PL-{pol.name}-{seq} seq 5 {action} {stanza.prefix}{le_str}")
+                elif stanza.match_any:
+                    lines.append(f"  ! match any")
+                if stanza.local_pref is not None:
+                    lines.append(f"  set local-preference {stanza.local_pref}")
                 seq += 10
             lines.append("!")
         return "\n".join(lines) + "\n"
@@ -394,33 +481,334 @@ class ConfigGenerator:
 
 
 # ===============================================================================
-# Helpers
+# JunOS Generator
 # ===============================================================================
 
-def _stable_id(name: str, mod: int = 253) -> int:
-    """Deterministic 1..mod integer from a device name (for router-ids / IPs)."""
-    h = 0
-    for ch in name:
-        h = (h * 31 + ord(ch)) & 0xFFFF
-    return (h % mod) + 1
+class JunOSConfigGenerator(ConfigGenerator):
+
+    VENDOR = "junos"
+    EXT    = ".conf"
+
+    def _render(self, dc: DeviceConfig) -> str:
+        parts = [self._header(dc)]
+        parts.append(self._system(dc))
+        if dc.ospf_areas:
+            parts.append(self._ospf(dc))
+        if dc.asn is not None:
+            parts.append(self._bgp(dc))
+        if dc.policies:
+            parts.append(self._policy(dc))
+        if dc.intents:
+            parts.append(self._intents(dc))
+        return "\n".join(parts)
+
+    def _header(self, dc: DeviceConfig) -> str:
+        ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        src = self.source_name or "RouterLang"
+        return (
+            f"/* {'=' * 56} */\n"
+            f"/* Auto-generated by RouterLang  [vendor: junos]      */\n"
+            f"/* Source    : {src:<44} */\n"
+            f"/* Device    : {dc.hostname:<44} */\n"
+            f"/* Role      : {dc.role:<44} */\n"
+            f"/* Generated : {ts:<44} */\n"
+            f"/* WARNING: Review carefully before applying.          */\n"
+            f"/* {'=' * 56} */\n"
+        )
+
+    def _system(self, dc: DeviceConfig) -> str:
+        return (
+            f"system {{\n"
+            f"    host-name {dc.hostname};\n"
+            f"    /* RouterLang role: {dc.role} */\n"
+            f"}}\n"
+        )
+
+    def _ospf(self, dc: DeviceConfig) -> str:
+        rid = f"0.0.0.{_stable_id(dc.hostname)}"
+        lines = ["protocols {", "    ospf {", f"        router-id {rid};"]
+        for area_id in dc.ospf_areas:
+            lines += [
+                f"        area {area_id} {{",
+                f"            interface all;",
+                f"        }}",
+            ]
+        lines += ["    }", "}"]
+        return "\n".join(lines) + "\n"
+
+    def _bgp(self, dc: DeviceConfig) -> str:
+        rid = f"0.0.0.{_stable_id(dc.hostname)}"
+        lines = [
+            "protocols {",
+            "    bgp {",
+            f"        local-as {dc.asn};",
+        ]
+        if dc.is_rr:
+            lines.append("        /* This device acts as a BGP Route Reflector */")
+        for peer_host, peer_asn in dc.bgp_peers:
+            peer_ip      = _stable_ip(peer_host)
+            peer_asn_str = str(peer_asn) if peer_asn is not None else "UNKNOWN"
+            lines += [
+                f"        group {peer_host} {{",
+                f"            type external;" if str(peer_asn) != str(dc.asn) else "            type internal;",
+                f"            peer-as {peer_asn_str};",
+                f"            neighbor {peer_ip} {{",
+                f"                description \"{peer_host}\";",
+            ]
+            if dc.is_rr:
+                lines.append(f"                cluster {rid};")
+            lines += [
+                f"            }}",
+                f"        }}",
+            ]
+        lines += ["    }", "}"]
+        return "\n".join(lines) + "\n"
+
+    def _policy(self, dc: DeviceConfig) -> str:
+        lines = ["policy-options {"]
+        for pol in dc.policies:
+            # prefix lists
+            for stanza in pol.stanzas:
+                if stanza.prefix:
+                    le_str = f" upto /{stanza.le}" if stanza.le else ""
+                    lines += [
+                        f"    prefix-list PL-{pol.name}-{stanza.rank or 'X'} {{",
+                        f"        {stanza.prefix}{le_str};",
+                        f"    }}",
+                    ]
+            # policy statement
+            lines += [
+                f"    policy-statement {pol.name} {{",
+            ]
+            for stanza in pol.stanzas:
+                term_name = f"term-{stanza.rank}" if stanza.rank is not None else "term-default"
+                lines.append(f"        term {term_name} {{")
+                lines.append(f"            from {{")
+                if stanza.prefix:
+                    lines.append(f"                prefix-list PL-{pol.name}-{stanza.rank or 'X'};")
+                elif stanza.match_any:
+                    lines.append(f"                /* match any */")
+                lines.append(f"            }}")
+                lines.append(f"            then {{")
+                if stanza.action == "permit":
+                    lines.append(f"                accept;")
+                else:
+                    lines.append(f"                reject;")
+                if stanza.local_pref is not None:
+                    lines.append(f"                local-preference {stanza.local_pref};")
+                lines.append(f"            }}")
+                lines.append(f"        }}")
+            lines += ["    }", "}"]
+        return "\n".join(lines) + "\n"
+
+    def _intents(self, dc: DeviceConfig) -> str:
+        lines = [
+            "/* -- Traffic Intents " + "-" * 36 + " */",
+        ]
+        for intent in dc.intents:
+            primary = " >> ".join(intent.primary_path) or "-"
+            backup  = " >> ".join(intent.backup_path)  or "none"
+            lines += [
+                f"/* Intent         : {intent.name}",
+                f"   Primary path   : {primary}",
+                f"   Backup  path   : {backup}",
+            ]
+            if intent.policy_ref:
+                lines.append(f"   Policy         : {intent.policy_ref}  -> apply as import/export policy")
+            if intent.fault_tol:
+                lines.append(f"   Fault-tolerance: k={intent.fault_tol}")
+            lines.append("*/")
+        return "\n".join(lines) + "\n"
 
 
-def _stable_ip(hostname: str) -> str:
-    """Deterministic loopback-style IP (10.0.0.x) for a device."""
-    return f"10.0.0.{_stable_id(hostname)}"
+# ===============================================================================
+# OpenConfig JSON Generator
+# ===============================================================================
+
+class OpenConfigGenerator(ConfigGenerator):
+
+    VENDOR = "openconfig"
+    EXT    = ".json"
+
+    def _render(self, dc: DeviceConfig) -> str:
+        ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        src = self.source_name or "RouterLang"
+        rid = f"0.0.0.{_stable_id(dc.hostname)}"
+
+        doc = {
+            "_routerlang_meta": {
+                "vendor":    "openconfig",
+                "source":    src,
+                "device":    dc.hostname,
+                "role":      dc.role,
+                "generated": ts,
+                "warning":   "Review carefully before applying to a live device.",
+            },
+            "openconfig-system:system": {
+                "config": {
+                    "hostname": dc.hostname,
+                }
+            },
+        }
+
+        # BGP
+        if dc.asn is not None:
+            neighbors = []
+            for peer_host, peer_asn in dc.bgp_peers:
+                peer_ip = _stable_ip(peer_host)
+                neighbor = {
+                    "neighbor-address": peer_ip,
+                    "config": {
+                        "neighbor-address": peer_ip,
+                        "peer-as": peer_asn if peer_asn is not None else 0,
+                        "description": peer_host,
+                    },
+                    "transport": {
+                        "config": {
+                            "local-address": "Loopback0",
+                        }
+                    },
+                }
+                if dc.is_rr:
+                    neighbor["route-reflector"] = {
+                        "config": {
+                            "route-reflector-client": True,
+                            "route-reflector-cluster-id": rid,
+                        }
+                    }
+                neighbors.append(neighbor)
+
+            doc["openconfig-bgp:bgp"] = {
+                "global": {
+                    "config": {
+                        "as": dc.asn,
+                        "router-id": rid,
+                    }
+                },
+                "neighbors": {
+                    "neighbor": neighbors,
+                },
+            }
+
+        # OSPF
+        if dc.ospf_areas:
+            areas = []
+            for area_id in dc.ospf_areas:
+                areas.append({
+                    "identifier": area_id,
+                    "config": {"identifier": area_id},
+                    "interfaces": {
+                        "interface": [
+                            {
+                                "id": "all",
+                                "config": {"id": "all", "passive": False},
+                            }
+                        ]
+                    },
+                })
+            doc["openconfig-ospfv2:ospfv2"] = {
+                "global": {
+                    "config": {"router-id": rid}
+                },
+                "areas": {"area": areas},
+            }
+
+        # Routing policy
+        if dc.policies:
+            policy_defs = []
+            for pol in dc.policies:
+                stmts = []
+                for stanza in pol.stanzas:
+                    term_name = f"term-{stanza.rank}" if stanza.rank is not None else "term-default"
+                    conditions = {}
+                    if stanza.prefix:
+                        le_str = f"/{stanza.le}" if stanza.le else ""
+                        conditions["match-prefix-set"] = {
+                            "config": {
+                                "prefix-set": f"PL-{pol.name}-{stanza.rank or 'X'}",
+                                "match-set-options": "ANY",
+                            }
+                        }
+                    actions = {
+                        "config": {
+                            "policy-result": "ACCEPT_ROUTE" if stanza.action == "permit" else "REJECT_ROUTE",
+                        }
+                    }
+                    if stanza.local_pref is not None:
+                        actions["bgp-actions"] = {
+                            "config": {
+                                "set-local-pref": stanza.local_pref,
+                            }
+                        }
+                    stmts.append({
+                        "name": term_name,
+                        "config": {"name": term_name},
+                        "conditions": conditions,
+                        "actions": actions,
+                    })
+                policy_defs.append({
+                    "name": pol.name,
+                    "config": {"name": pol.name},
+                    "statements": {"statement": stmts},
+                })
+            doc["openconfig-routing-policy:routing-policy"] = {
+                "policy-definitions": {
+                    "policy-definition": policy_defs,
+                }
+            }
+
+        # Intents as metadata comments
+        if dc.intents:
+            intent_meta = []
+            for intent in dc.intents:
+                intent_meta.append({
+                    "name":         intent.name,
+                    "primary_path": " >> ".join(intent.primary_path),
+                    "backup_path":  " >> ".join(intent.backup_path) or "none",
+                    "policy":       intent.policy_ref or "",
+                    "fault_tolerance": intent.fault_tol,
+                })
+            doc["_routerlang_intents"] = intent_meta
+
+        return json.dumps(doc, indent=2) + "\n"
+
+
+# ===============================================================================
+# Factory -- pick the right generator by vendor name
+# ===============================================================================
+
+_GENERATORS = {
+    "cisco":      CiscoConfigGenerator,
+    "junos":      JunOSConfigGenerator,
+    "openconfig": OpenConfigGenerator,
+}
+
+SUPPORTED_VENDORS = list(_GENERATORS.keys())
+
+
+def get_generator(vendor: str, model: NetworkModel, source_name: str = "") -> ConfigGenerator:
+    """Return the correct ConfigGenerator subclass for *vendor*."""
+    vendor = vendor.lower().strip()
+    cls = _GENERATORS.get(vendor)
+    if cls is None:
+        raise ValueError(
+            f"Unknown vendor '{vendor}'. "
+            f"Supported: {', '.join(SUPPORTED_VENDORS)}"
+        )
+    return cls(model, source_name=source_name)
 
 
 # ===============================================================================
 # Public entry point used by main.py
 # ===============================================================================
 
-def generate_configs(source: str, source_name: str, out_dir: str) -> list:
+def generate_configs(source: str, source_name: str, out_dir: str, vendor: str = "cisco") -> list:
     """
-    Parse *source*, generate one .cfg per device, write to *out_dir*.
+    Parse *source*, generate one config file per device, write to *out_dir*.
     Returns sorted list of written file paths.
     """
     model = _parse_network(source)
-    gen   = ConfigGenerator(model, source_name=source_name)
+    gen   = get_generator(vendor, model, source_name=source_name)
     return gen.write(out_dir)
 
 
@@ -432,10 +820,16 @@ if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(
-        description="RouterLang Config Generator -- generate .cfg files from a .rl source"
+        description="RouterLang Config Generator -- generate config files from a .rl source"
     )
     ap.add_argument("file",      help="Path to a .rl source file")
     ap.add_argument("--out-dir", default="", help="Output directory (default: ./output/<name>/)")
+    ap.add_argument(
+        "--vendor",
+        default="cisco",
+        choices=SUPPORTED_VENDORS,
+        help=f"Target vendor syntax (default: cisco). Choices: {', '.join(SUPPORTED_VENDORS)}",
+    )
     args = ap.parse_args()
 
     if not os.path.isfile(args.file):
@@ -448,8 +842,8 @@ if __name__ == "__main__":
     basename = os.path.splitext(os.path.basename(args.file))[0]
     out_dir  = args.out_dir or os.path.join("output", basename)
 
-    print(f"\nGenerating configs for '{args.file}' -> '{out_dir}/'")
-    written = generate_configs(source, args.file, out_dir)
+    print(f"\nGenerating configs for '{args.file}' -> '{out_dir}/'  [vendor: {args.vendor}]")
+    written = generate_configs(source, args.file, out_dir, vendor=args.vendor)
     for p in written:
         print(f"  OK  {p}")
     print(f"\n{len(written)} config file(s) written.")
