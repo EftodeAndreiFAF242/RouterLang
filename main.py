@@ -13,6 +13,8 @@ Usage:
     python main.py <file.rl> --generate --vendor junos
     python main.py <file.rl> --generate --vendor openconfig
     python main.py <file.rl> --generate --out-dir ./my-configs
+    python main.py <file.rl> --generate --ipam ipam.csv
+    python main.py <file.rl> --generate --vendor junos --ipam ipam.csv
     python main.py --example                          # run built-in example and exit
 """
 
@@ -312,7 +314,7 @@ def run_semantic(source):
 
 # ── Stage 5: Config Generator ──────────────────────────────────────────────────
 
-def run_config_generator(source, filename, out_dir, vendor="cisco"):
+def run_config_generator(source, filename, out_dir, vendor="cisco", ipam_path=""):
     section("STAGE 5 — Config Generation")
     try:
         from config_generator import generate_configs, SUPPORTED_VENDORS
@@ -321,9 +323,15 @@ def run_config_generator(source, filename, out_dir, vendor="cisco"):
         return [], False
 
     info(f"Vendor target  : {vendor}")
+    if ipam_path:
+        if os.path.isfile(ipam_path):
+            info(f"IPAM file      : {ipam_path}  (real IPs)")
+        else:
+            warn(f"IPAM file not found: {ipam_path}  (falling back to hash-derived IPs)")
 
     try:
-        written = generate_configs(source, filename, out_dir, vendor=vendor)
+        written = generate_configs(source, filename, out_dir,
+                                   vendor=vendor, ipam_path=ipam_path)
     except ValueError as e:
         fail(str(e))
         return [], False
@@ -344,7 +352,8 @@ def run_config_generator(source, filename, out_dir, vendor="cisco"):
 
 # ── Summary ────────────────────────────────────────────────────────────────────
 
-def print_summary(source, stages, stage_names, elapsed, generated_files=None, vendor=None):
+def print_summary(source, stages, stage_names, elapsed,
+                  generated_files=None, vendor=None, ipam_path=""):
     section("SUMMARY")
 
     passed = all(stages)
@@ -358,6 +367,12 @@ def print_summary(source, stages, stage_names, elapsed, generated_files=None, ve
     print(f"  {GREY}Time elapsed : {elapsed*1000:.1f} ms{RESET}")
     if vendor:
         print(f"  {GREY}Vendor target: {vendor}{RESET}")
+    if ipam_path:
+        ip_label = "IPAM" if os.path.isfile(ipam_path) else "IPAM (file not found — hash fallback)"
+        print(f"  {GREY}IP source    : {ipam_path}  [{ip_label}]{RESET}")
+    else:
+        if vendor:
+            print(f"  {GREY}IP source    : hash-derived (no --ipam provided){RESET}")
 
     if generated_files:
         print(f"\n  {BOLD}{CYAN}Generated config files:{RESET}")
@@ -392,14 +407,22 @@ def main():
         choices=["cisco", "junos", "openconfig"],
         help=(
             "Target vendor syntax for --generate. "
-            "cisco  = Cisco IOS CLI  (default, .cfg files)  "
-            "junos  = JunOS hierarchical CLI  (.conf files)  "
-            "openconfig = OpenConfig JSON  (.json files)"
+            "cisco = Cisco IOS CLI (default, .cfg)  "
+            "junos = JunOS hierarchical CLI (.conf)  "
+            "openconfig = OpenConfig JSON (.json)"
         ),
     )
     parser.add_argument(
         "--out-dir", default="",
         help="Output directory for generated configs (default: ./output/<filename>/)"
+    )
+    parser.add_argument(
+        "--ipam", default="",
+        help=(
+            "Path to a CSV file mapping device names to real IP addresses. "
+            "Expected columns: device, loopback_ip, mgmt_ip. "
+            "If omitted or a device is missing, hash-derived IPs are used as fallback."
+        ),
     )
     args = parser.parse_args()
 
@@ -427,6 +450,8 @@ def main():
     print(f"  {GREY}Lines  : {source.count(chr(10))+1}{RESET}")
     if args.generate:
         print(f"  {GREY}Vendor : {args.vendor}{RESET}")
+        if args.ipam:
+            print(f"  {GREY}IPAM   : {args.ipam}{RESET}")
 
     t0 = time.time()
 
@@ -444,7 +469,9 @@ def main():
         if all([ok1, ok2, ok3, ok4]):
             out_dir = args.out_dir or os.path.join("output", basename)
             files, ok5 = run_config_generator(
-                source, filename, out_dir, vendor=args.vendor
+                source, filename, out_dir,
+                vendor=args.vendor,
+                ipam_path=args.ipam,
             )
             generated_files = files
             all_stages.append(ok5)
@@ -457,6 +484,7 @@ def main():
         source, all_stages, stage_names, elapsed,
         generated_files,
         vendor=args.vendor if args.generate else None,
+        ipam_path=args.ipam if args.generate else "",
     )
 
     sys.exit(0 if all(all_stages) else 1)

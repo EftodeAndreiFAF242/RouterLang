@@ -8,6 +8,17 @@ Supported vendors (--vendor flag in main.py):
     junos      JunOS hierarchical CLI (set-style)
     openconfig OpenConfig JSON (RFC 7951)
 
+IPAM support:
+    Pass --ipam <path/to/ipam.csv> to use real IP addresses instead of
+    hash-derived ones. The CSV must have columns: device, loopback_ip, mgmt_ip
+    Example:
+        device,loopback_ip,mgmt_ip
+        R-SPINE-1,10.0.1.1,192.168.1.1
+        R-LEAF-1,10.0.2.1,192.168.1.11
+
+    If no CSV is provided, or a device is not found in the CSV,
+    the generator falls back to the original hash-based IP automatically.
+
 This module does NOT rely on symbol_table.py or semantic_checker.py.
 It parses the ANTLR tree directly with its own lightweight listener,
 so it is immune to grammar-mismatch bugs in those modules.
@@ -23,15 +34,19 @@ Usage (standalone):
     python src/compiler/config_generator.py my_network.rl --out-dir ./configs
     python src/compiler/config_generator.py my_network.rl --vendor junos
     python src/compiler/config_generator.py my_network.rl --vendor openconfig
+    python src/compiler/config_generator.py my_network.rl --ipam ipam.csv
 
 Usage (from main.py via --generate flag):
     python main.py my_network.rl --generate
     python main.py my_network.rl --generate --vendor junos
     python main.py my_network.rl --generate --vendor openconfig --out-dir ./configs
+    python main.py my_network.rl --generate --ipam ipam.csv
+    python main.py my_network.rl --generate --vendor junos --ipam ipam.csv
 """
 
 import os
 import sys
+import csv
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -239,6 +254,39 @@ def _parse_network(source: str) -> NetworkModel:
 
 
 # ===============================================================================
+# IPAM loader
+# ===============================================================================
+
+def load_ipam(csv_path: str) -> dict:
+    """
+    Load a CSV file mapping device names to IP addresses.
+
+    Expected CSV format:
+        device,loopback_ip,mgmt_ip
+        R-SPINE-1,10.0.1.1,192.168.1.1
+        R-LEAF-1,10.0.2.1,192.168.1.11
+
+    Returns:
+        {hostname: {"loopback_ip": "...", "mgmt_ip": "..."}}
+
+    Falls back gracefully if the file does not exist or a row is malformed.
+    Devices not present in the CSV will automatically use hash-based IPs.
+    """
+    ipam = {}
+    if not csv_path or not os.path.isfile(csv_path):
+        return ipam
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            device = row.get("device", "").strip()
+            if device:
+                ipam[device] = {
+                    "loopback_ip": row.get("loopback_ip", "").strip(),
+                    "mgmt_ip":     row.get("mgmt_ip", "").strip(),
+                }
+    return ipam
+
+
+# ===============================================================================
 # DeviceConfig -- one per physical device we will emit a .cfg for
 # ===============================================================================
 
@@ -280,9 +328,29 @@ class ConfigGenerator:
     VENDOR = "cisco"   # overridden by subclasses
     EXT    = ".cfg"
 
-    def __init__(self, model: NetworkModel, source_name: str = ""):
+    def __init__(self, model: NetworkModel, source_name: str = "", ipam: dict = None):
         self.model       = model
         self.source_name = source_name
+        self.ipam        = ipam or {}   # {hostname: {loopback_ip, mgmt_ip}}
+
+    # -- IP resolution (IPAM-aware, falls back to hash)
+
+    def _get_ip(self, hostname: str) -> str:
+        """
+        Return the loopback IP for a device.
+        Uses the IPAM table when available, falls back to hash-based IP.
+        """
+        entry = self.ipam.get(hostname, {})
+        return entry.get("loopback_ip") or _stable_ip(hostname)
+
+    def _get_rid(self, hostname: str) -> str:
+        """
+        Return the router-id for a device.
+        Uses IPAM loopback IP when available, falls back to 0.0.0.<hash>.
+        """
+        entry = self.ipam.get(hostname, {})
+        loopback = entry.get("loopback_ip", "")
+        return loopback if loopback else f"0.0.0.{_stable_id(hostname)}"
 
     # -- public API
 
@@ -362,7 +430,7 @@ class ConfigGenerator:
 
 
 # ===============================================================================
-# Cisco IOS Generator  (original behaviour preserved exactly)
+# Cisco IOS Generator
 # ===============================================================================
 
 class CiscoConfigGenerator(ConfigGenerator):
@@ -386,12 +454,14 @@ class CiscoConfigGenerator(ConfigGenerator):
     def _header(self, dc: DeviceConfig) -> str:
         ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         src = self.source_name or "RouterLang"
+        ip_source = "IPAM" if dc.hostname in self.ipam else "hash-derived"
         return (
             f"! {'=' * 58}\n"
             f"! Auto-generated by RouterLang  [vendor: cisco]\n"
             f"! Source    : {src}\n"
             f"! Device    : {dc.hostname}\n"
             f"! Role      : {dc.role}\n"
+            f"! Loopback  : {self._get_ip(dc.hostname)}  ({ip_source})\n"
             f"! Generated : {ts}\n"
             f"! {'=' * 58}\n"
             f"!\n"
@@ -403,23 +473,23 @@ class CiscoConfigGenerator(ConfigGenerator):
         return f"hostname {dc.hostname}\n"
 
     def _ospf(self, dc: DeviceConfig) -> str:
-        rid = _stable_id(dc.hostname)
+        rid = self._get_rid(dc.hostname)
         lines = ["!", "! -- OSPF " + "-" * 48]
         for area_id in dc.ospf_areas:
             lines += [
                 "router ospf 1",
-                f"  router-id 0.0.0.{rid}",
+                f"  router-id {rid}",
                 f"  network 0.0.0.0 255.255.255.255 area {area_id}",
                 "!",
             ]
         return "\n".join(lines) + "\n"
 
     def _bgp(self, dc: DeviceConfig) -> str:
-        rid = _stable_id(dc.hostname)
+        rid = self._get_rid(dc.hostname)
         lines = [
             "!", "! -- BGP " + "-" * 49,
             f"router bgp {dc.asn}",
-            f"  bgp router-id 0.0.0.{rid}",
+            f"  bgp router-id {rid}",
         ]
         if dc.is_rr:
             lines += [
@@ -427,7 +497,7 @@ class CiscoConfigGenerator(ConfigGenerator):
                 "  ! This device acts as a BGP Route Reflector",
             ]
         for peer_host, peer_asn in dc.bgp_peers:
-            peer_ip      = _stable_ip(peer_host)
+            peer_ip      = self._get_ip(peer_host)
             peer_asn_str = str(peer_asn) if peer_asn is not None else "UNKNOWN"
             lines += [
                 "  !",
@@ -505,12 +575,15 @@ class JunOSConfigGenerator(ConfigGenerator):
     def _header(self, dc: DeviceConfig) -> str:
         ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         src = self.source_name or "RouterLang"
+        ip_source = "IPAM" if dc.hostname in self.ipam else "hash-derived"
         return (
             f"/* {'=' * 56} */\n"
             f"/* Auto-generated by RouterLang  [vendor: junos]      */\n"
             f"/* Source    : {src:<44} */\n"
             f"/* Device    : {dc.hostname:<44} */\n"
             f"/* Role      : {dc.role:<44} */\n"
+            f"/* Loopback  : {self._get_ip(dc.hostname):<44} */\n"
+            f"/* IP source : {ip_source:<44} */\n"
             f"/* Generated : {ts:<44} */\n"
             f"/* WARNING: Review carefully before applying.          */\n"
             f"/* {'=' * 56} */\n"
@@ -525,7 +598,7 @@ class JunOSConfigGenerator(ConfigGenerator):
         )
 
     def _ospf(self, dc: DeviceConfig) -> str:
-        rid = f"0.0.0.{_stable_id(dc.hostname)}"
+        rid = self._get_rid(dc.hostname)
         lines = ["protocols {", "    ospf {", f"        router-id {rid};"]
         for area_id in dc.ospf_areas:
             lines += [
@@ -537,7 +610,7 @@ class JunOSConfigGenerator(ConfigGenerator):
         return "\n".join(lines) + "\n"
 
     def _bgp(self, dc: DeviceConfig) -> str:
-        rid = f"0.0.0.{_stable_id(dc.hostname)}"
+        rid = self._get_rid(dc.hostname)
         lines = [
             "protocols {",
             "    bgp {",
@@ -546,7 +619,7 @@ class JunOSConfigGenerator(ConfigGenerator):
         if dc.is_rr:
             lines.append("        /* This device acts as a BGP Route Reflector */")
         for peer_host, peer_asn in dc.bgp_peers:
-            peer_ip      = _stable_ip(peer_host)
+            peer_ip      = self._get_ip(peer_host)
             peer_asn_str = str(peer_asn) if peer_asn is not None else "UNKNOWN"
             lines += [
                 f"        group {peer_host} {{",
@@ -567,7 +640,6 @@ class JunOSConfigGenerator(ConfigGenerator):
     def _policy(self, dc: DeviceConfig) -> str:
         lines = ["policy-options {"]
         for pol in dc.policies:
-            # prefix lists
             for stanza in pol.stanzas:
                 if stanza.prefix:
                     le_str = f" upto /{stanza.le}" if stanza.le else ""
@@ -576,10 +648,7 @@ class JunOSConfigGenerator(ConfigGenerator):
                         f"        {stanza.prefix}{le_str};",
                         f"    }}",
                     ]
-            # policy statement
-            lines += [
-                f"    policy-statement {pol.name} {{",
-            ]
+            lines += [f"    policy-statement {pol.name} {{"]
             for stanza in pol.stanzas:
                 term_name = f"term-{stanza.rank}" if stanza.rank is not None else "term-default"
                 lines.append(f"        term {term_name} {{")
@@ -602,9 +671,7 @@ class JunOSConfigGenerator(ConfigGenerator):
         return "\n".join(lines) + "\n"
 
     def _intents(self, dc: DeviceConfig) -> str:
-        lines = [
-            "/* -- Traffic Intents " + "-" * 36 + " */",
-        ]
+        lines = ["/* -- Traffic Intents " + "-" * 36 + " */"]
         for intent in dc.intents:
             primary = " >> ".join(intent.primary_path) or "-"
             backup  = " >> ".join(intent.backup_path)  or "none"
@@ -633,7 +700,8 @@ class OpenConfigGenerator(ConfigGenerator):
     def _render(self, dc: DeviceConfig) -> str:
         ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         src = self.source_name or "RouterLang"
-        rid = f"0.0.0.{_stable_id(dc.hostname)}"
+        rid = self._get_rid(dc.hostname)
+        ip_source = "IPAM" if dc.hostname in self.ipam else "hash-derived"
 
         doc = {
             "_routerlang_meta": {
@@ -641,13 +709,13 @@ class OpenConfigGenerator(ConfigGenerator):
                 "source":    src,
                 "device":    dc.hostname,
                 "role":      dc.role,
+                "loopback":  self._get_ip(dc.hostname),
+                "ip_source": ip_source,
                 "generated": ts,
                 "warning":   "Review carefully before applying to a live device.",
             },
             "openconfig-system:system": {
-                "config": {
-                    "hostname": dc.hostname,
-                }
+                "config": {"hostname": dc.hostname}
             },
         }
 
@@ -655,7 +723,7 @@ class OpenConfigGenerator(ConfigGenerator):
         if dc.asn is not None:
             neighbors = []
             for peer_host, peer_asn in dc.bgp_peers:
-                peer_ip = _stable_ip(peer_host)
+                peer_ip = self._get_ip(peer_host)
                 neighbor = {
                     "neighbor-address": peer_ip,
                     "config": {
@@ -664,9 +732,7 @@ class OpenConfigGenerator(ConfigGenerator):
                         "description": peer_host,
                     },
                     "transport": {
-                        "config": {
-                            "local-address": "Loopback0",
-                        }
+                        "config": {"local-address": "Loopback0"}
                     },
                 }
                 if dc.is_rr:
@@ -680,14 +746,9 @@ class OpenConfigGenerator(ConfigGenerator):
 
             doc["openconfig-bgp:bgp"] = {
                 "global": {
-                    "config": {
-                        "as": dc.asn,
-                        "router-id": rid,
-                    }
+                    "config": {"as": dc.asn, "router-id": rid}
                 },
-                "neighbors": {
-                    "neighbor": neighbors,
-                },
+                "neighbors": {"neighbor": neighbors},
             }
 
         # OSPF
@@ -699,17 +760,12 @@ class OpenConfigGenerator(ConfigGenerator):
                     "config": {"identifier": area_id},
                     "interfaces": {
                         "interface": [
-                            {
-                                "id": "all",
-                                "config": {"id": "all", "passive": False},
-                            }
+                            {"id": "all", "config": {"id": "all", "passive": False}}
                         ]
                     },
                 })
             doc["openconfig-ospfv2:ospfv2"] = {
-                "global": {
-                    "config": {"router-id": rid}
-                },
+                "global": {"config": {"router-id": rid}},
                 "areas": {"area": areas},
             }
 
@@ -722,7 +778,6 @@ class OpenConfigGenerator(ConfigGenerator):
                     term_name = f"term-{stanza.rank}" if stanza.rank is not None else "term-default"
                     conditions = {}
                     if stanza.prefix:
-                        le_str = f"/{stanza.le}" if stanza.le else ""
                         conditions["match-prefix-set"] = {
                             "config": {
                                 "prefix-set": f"PL-{pol.name}-{stanza.rank or 'X'}",
@@ -736,9 +791,7 @@ class OpenConfigGenerator(ConfigGenerator):
                     }
                     if stanza.local_pref is not None:
                         actions["bgp-actions"] = {
-                            "config": {
-                                "set-local-pref": stanza.local_pref,
-                            }
+                            "config": {"set-local-pref": stanza.local_pref}
                         }
                     stmts.append({
                         "name": term_name,
@@ -752,23 +805,21 @@ class OpenConfigGenerator(ConfigGenerator):
                     "statements": {"statement": stmts},
                 })
             doc["openconfig-routing-policy:routing-policy"] = {
-                "policy-definitions": {
-                    "policy-definition": policy_defs,
-                }
+                "policy-definitions": {"policy-definition": policy_defs}
             }
 
-        # Intents as metadata comments
+        # Intents as metadata
         if dc.intents:
-            intent_meta = []
-            for intent in dc.intents:
-                intent_meta.append({
-                    "name":         intent.name,
-                    "primary_path": " >> ".join(intent.primary_path),
-                    "backup_path":  " >> ".join(intent.backup_path) or "none",
-                    "policy":       intent.policy_ref or "",
+            doc["_routerlang_intents"] = [
+                {
+                    "name":          intent.name,
+                    "primary_path":  " >> ".join(intent.primary_path),
+                    "backup_path":   " >> ".join(intent.backup_path) or "none",
+                    "policy":        intent.policy_ref or "",
                     "fault_tolerance": intent.fault_tol,
-                })
-            doc["_routerlang_intents"] = intent_meta
+                }
+                for intent in dc.intents
+            ]
 
         return json.dumps(doc, indent=2) + "\n"
 
@@ -786,7 +837,8 @@ _GENERATORS = {
 SUPPORTED_VENDORS = list(_GENERATORS.keys())
 
 
-def get_generator(vendor: str, model: NetworkModel, source_name: str = "") -> ConfigGenerator:
+def get_generator(vendor: str, model: NetworkModel,
+                  source_name: str = "", ipam: dict = None) -> ConfigGenerator:
     """Return the correct ConfigGenerator subclass for *vendor*."""
     vendor = vendor.lower().strip()
     cls = _GENERATORS.get(vendor)
@@ -795,20 +847,22 @@ def get_generator(vendor: str, model: NetworkModel, source_name: str = "") -> Co
             f"Unknown vendor '{vendor}'. "
             f"Supported: {', '.join(SUPPORTED_VENDORS)}"
         )
-    return cls(model, source_name=source_name)
+    return cls(model, source_name=source_name, ipam=ipam or {})
 
 
 # ===============================================================================
 # Public entry point used by main.py
 # ===============================================================================
 
-def generate_configs(source: str, source_name: str, out_dir: str, vendor: str = "cisco") -> list:
+def generate_configs(source: str, source_name: str, out_dir: str,
+                     vendor: str = "cisco", ipam_path: str = "") -> list:
     """
     Parse *source*, generate one config file per device, write to *out_dir*.
     Returns sorted list of written file paths.
     """
     model = _parse_network(source)
-    gen   = get_generator(vendor, model, source_name=source_name)
+    ipam  = load_ipam(ipam_path)
+    gen   = get_generator(vendor, model, source_name=source_name, ipam=ipam)
     return gen.write(out_dir)
 
 
@@ -830,6 +884,11 @@ if __name__ == "__main__":
         choices=SUPPORTED_VENDORS,
         help=f"Target vendor syntax (default: cisco). Choices: {', '.join(SUPPORTED_VENDORS)}",
     )
+    ap.add_argument(
+        "--ipam",
+        default="",
+        help="Path to a CSV file mapping device names to IP addresses (optional)",
+    )
     args = ap.parse_args()
 
     if not os.path.isfile(args.file):
@@ -843,7 +902,10 @@ if __name__ == "__main__":
     out_dir  = args.out_dir or os.path.join("output", basename)
 
     print(f"\nGenerating configs for '{args.file}' -> '{out_dir}/'  [vendor: {args.vendor}]")
-    written = generate_configs(source, args.file, out_dir, vendor=args.vendor)
+    if args.ipam:
+        print(f"Using IPAM file: {args.ipam}")
+    written = generate_configs(source, args.file, out_dir,
+                               vendor=args.vendor, ipam_path=args.ipam)
     for p in written:
         print(f"  OK  {p}")
     print(f"\n{len(written)} config file(s) written.")
