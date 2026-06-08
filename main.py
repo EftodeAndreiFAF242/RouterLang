@@ -15,6 +15,9 @@ Usage:
     python main.py <file.rl> --generate --out-dir ./my-configs
     python main.py <file.rl> --generate --ipam ipam.csv
     python main.py <file.rl> --generate --vendor junos --ipam ipam.csv
+    python main.py <file.rl> --generate --deploy --ipam ipam.csv
+    python main.py <file.rl> --generate --deploy --dry-run --ipam ipam.csv
+    python main.py <file.rl> --generate --deploy --creds credentials.ini --ipam ipam.csv
     python main.py --example                          # run built-in example and exit
 """
 
@@ -350,10 +353,53 @@ def run_config_generator(source, filename, out_dir, vendor="cisco", ipam_path=""
         info(path)
     return written, True
 
+# ── Stage 6: Deploy ────────────────────────────────────────────────────────────
+
+def run_deploy(generated_files, ipam_path, vendor, creds_path, dry_run=False):
+    section("STAGE 6 — Deploy")
+    try:
+        from deploy import deploy_configs, load_credentials, print_deploy_summary, write_deploy_log
+        from config_generator import load_ipam
+    except ImportError as e:
+        fail(f"Deploy module not available: {e}")
+        fail("Make sure deploy.py is in src/compiler/ and napalm is installed.")
+        fail("Run: pip install napalm")
+        return False
+
+    if vendor == "openconfig":
+        warn("OpenConfig JSON cannot be deployed via NAPALM — use NETCONF/RESTCONF.")
+        return False
+
+    if not ipam_path or not os.path.isfile(ipam_path):
+        fail("--deploy requires a valid --ipam file with mgmt_ip addresses.")
+        fail("Example: --ipam ipam.csv")
+        return False
+
+    # Load IPAM and credentials
+    ipam  = load_ipam(ipam_path)
+    creds = load_credentials(creds_path)
+
+    # Run the deploy
+    results = deploy_configs(
+        generated_files = generated_files,
+        ipam            = ipam,
+        vendor          = vendor,
+        creds           = creds,
+        dry_run         = dry_run,
+    )
+
+    # Print summary and write log
+    print_deploy_summary(results)
+    log_path = write_deploy_log(results)
+    info(f"Deploy log written → {log_path}")
+
+    failed = [r for r in results if r.status == "FAILED"]
+    return len(failed) == 0
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 
 def print_summary(source, stages, stage_names, elapsed,
-                  generated_files=None, vendor=None, ipam_path=""):
+                  generated_files=None, vendor=None, ipam_path="", deploy_ran=False, dry_run=False):
     section("SUMMARY")
 
     passed = all(stages)
@@ -373,6 +419,9 @@ def print_summary(source, stages, stage_names, elapsed,
     else:
         if vendor:
             print(f"  {GREY}IP source    : hash-derived (no --ipam provided){RESET}")
+    if deploy_ran:
+        mode = "dry-run" if dry_run else "live"
+        print(f"  {GREY}Deploy mode  : {mode}{RESET}")
 
     if generated_files:
         print(f"\n  {BOLD}{CYAN}Generated config files:{RESET}")
@@ -424,6 +473,18 @@ def main():
             "If omitted or a device is missing, hash-derived IPs are used as fallback."
         ),
     )
+    parser.add_argument(
+        "--deploy", action="store_true",
+        help="Push generated configs to devices via NAPALM after generation. Requires --ipam.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Used with --deploy: show what would change on each device without applying anything.",
+    )
+    parser.add_argument(
+        "--creds", default="credentials.ini",
+        help="Path to credentials.ini file for SSH login (default: credentials.ini).",
+    )
     args = parser.parse_args()
 
     show_tokens  = args.tokens  or args.verbose
@@ -452,6 +513,10 @@ def main():
         print(f"  {GREY}Vendor : {args.vendor}{RESET}")
         if args.ipam:
             print(f"  {GREY}IPAM   : {args.ipam}{RESET}")
+        if args.deploy:
+            mode = "dry-run" if args.dry_run else "live"
+            print(f"  {GREY}Deploy : {mode}{RESET}")
+            print(f"  {GREY}Creds  : {args.creds}{RESET}")
 
     t0 = time.time()
 
@@ -463,6 +528,7 @@ def main():
     generated_files = []
     stage_names     = ["Lexer", "Parser", "Symbol Table", "Semantic"]
     all_stages      = [ok1, ok2, ok3, ok4]
+    deploy_ran      = False
 
     if args.generate:
         stage_names.append("Config Generation")
@@ -479,12 +545,28 @@ def main():
             warn("Skipping config generation — fix validation errors first.")
             all_stages.append(False)
 
+    if args.deploy and generated_files:
+        stage_names.append("Deploy")
+        deploy_ran = True
+        ok6 = run_deploy(
+            generated_files = generated_files,
+            ipam_path       = args.ipam,
+            vendor          = args.vendor,
+            creds_path      = args.creds,
+            dry_run         = args.dry_run,
+        )
+        all_stages.append(ok6)
+    elif args.deploy and not generated_files:
+        warn("--deploy was requested but no config files were generated — skipping deploy.")
+
     elapsed = time.time() - t0
     print_summary(
         source, all_stages, stage_names, elapsed,
         generated_files,
-        vendor=args.vendor if args.generate else None,
-        ipam_path=args.ipam if args.generate else "",
+        vendor   = args.vendor if args.generate else None,
+        ipam_path= args.ipam if args.generate else "",
+        deploy_ran = deploy_ran,
+        dry_run    = args.dry_run,
     )
 
     sys.exit(0 if all(all_stages) else 1)
