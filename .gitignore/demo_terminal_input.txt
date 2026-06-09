@@ -1,0 +1,4 @@
+python main.py my_network.rl --verbose
+python main.py my_network.rl --generate   // .cfg file 
+python main.py my_network.rl --generate --vendor junos
+python main.py my_network.rl --generate --deploy --dry-run --ipam ipam.csv
