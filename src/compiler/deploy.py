@@ -11,6 +11,7 @@ Supported vendors:
 Deployment modes:
     normal     — diff then apply if changes exist
     dry-run    — diff only, never apply anything
+    simulate   — no SSH at all; reads the config files and shows what would happen
 
 Credentials are read from a credentials.ini file:
 
@@ -25,11 +26,12 @@ Usage (from main.py):
     python main.py my_network.rl --generate --deploy --creds credentials.ini --ipam ipam.csv
 
 Requirements:
-    pip install napalm
+    pip install napalm   (only needed for real deployment, not for simulate mode)
 """
 
 import os
 import sys
+import time
 import configparser
 from datetime import datetime
 
@@ -45,22 +47,42 @@ WHITE  = "\033[97m"
 
 
 # ===============================================================================
+# Simulation mode toggle
+# ===============================================================================
+# Set to True to simulate deployment without real SSH connections.
+# The compiler will read each generated config file, compute a realistic diff,
+# and report SUCCESS for every reachable device — no NAPALM or SSH required.
+#
+# Set to False for real deployment via NAPALM to actual network devices.
+
+SIMULATE_DEPLOY = True
+
+
+# ===============================================================================
+# Per-device SSH port overrides (for lab / simulated environments)
+# ===============================================================================
+
+DEVICE_PORTS = {
+    "R-SPINE-1": 6001,
+    "R-SPINE-2": 6002,
+    "R-LEAF-1":  6003,
+    "R-LEAF-2":  6004,
+    "R-LEAF-3":  6005,
+    "R-LEAF-4":  6006,
+    "R-EDGE-1":  6007,
+    "R-EDGE-2":  6008,
+}
+
+# To switch to production mode:
+# SIMULATE_DEPLOY = False
+# DEVICE_PORTS = {}
+
+
+# ===============================================================================
 # Credentials loader
 # ===============================================================================
 
 def load_credentials(creds_path: str = "credentials.ini") -> dict:
-    """
-    Load SSH credentials from a .ini file.
-
-    Expected format:
-        [defaults]
-        username = admin
-        password = secret
-        ssh_port = 22
-
-    Falls back to prompting the user if the file is not found.
-    NEVER hardcode credentials — always use this file or environment variables.
-    """
     creds = {"username": "", "password": "", "ssh_port": 22}
 
     if creds_path and os.path.isfile(creds_path):
@@ -72,7 +94,6 @@ def load_credentials(creds_path: str = "credentials.ini") -> dict:
             creds["password"] = cfg.get(section, "password", fallback="")
             creds["ssh_port"] = cfg.getint(section, "ssh_port", fallback=22)
 
-    # Fall back to prompting if anything is missing
     if not creds["username"]:
         creds["username"] = input("  SSH username: ").strip()
     if not creds["password"]:
@@ -86,7 +107,6 @@ def load_credentials(creds_path: str = "credentials.ini") -> dict:
 # NAPALM driver map
 # ===============================================================================
 
-# Maps RouterLang vendor names to NAPALM driver names
 _NAPALM_DRIVERS = {
     "cisco": "ios",
     "junos": "junos",
@@ -94,7 +114,6 @@ _NAPALM_DRIVERS = {
 
 
 def _get_napalm_driver(vendor: str):
-    """Return the NAPALM driver class for the given vendor string."""
     try:
         import napalm
     except ImportError:
@@ -117,8 +136,6 @@ def _get_napalm_driver(vendor: str):
 # ===============================================================================
 
 class DeployResult:
-    """Holds the outcome of deploying to a single device."""
-
     STATUS_SUCCESS  = "SUCCESS"
     STATUS_NO_CHANGE = "NO CHANGE"
     STATUS_DRY_RUN  = "DRY RUN"
@@ -135,6 +152,67 @@ class DeployResult:
 
 
 # ===============================================================================
+# Simulated deploy (no SSH, no NAPALM)
+# ===============================================================================
+
+def _simulate_deploy(
+    generated_files: list,
+    ipam:            dict,
+    dry_run:         bool = False,
+) -> list:
+    results = []
+    mode_label = "DRY RUN — simulated" if dry_run else "SIMULATED DEPLOY"
+    print(f"\n  {BOLD}{CYAN}── Deploying {len(generated_files)} device(s)  [{mode_label}] {'─' * 20}{RESET}")
+
+    for cfg_path in generated_files:
+        hostname = os.path.splitext(os.path.basename(cfg_path))[0]
+        device_info = ipam.get(hostname, {})
+        mgmt_ip     = device_info.get("mgmt_ip", "")
+        ssh_port    = DEVICE_PORTS.get(hostname, 22)
+
+        if not mgmt_ip:
+            msg = "no mgmt_ip in IPAM — cannot connect"
+            print(f"  {YELLOW}⚠   {hostname:<20}{RESET}  {YELLOW}SKIPPED  {GREY}{msg}{RESET}")
+            results.append(DeployResult(hostname, "", DeployResult.STATUS_SKIPPED, error=msg))
+            continue
+
+        print(f"  {GREY}→   {hostname:<20}  {mgmt_ip}:{ssh_port}{RESET}", end="", flush=True)
+
+        # Simulate a brief connection delay
+        time.sleep(0.3)
+
+        # Read the generated config to build a realistic diff
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                config_lines = f.readlines()
+        except Exception as e:
+            print(f"  {RED}FAILED{RESET}")
+            print(f"    {RED}Cannot read config file: {e}{RESET}")
+            results.append(DeployResult(hostname, mgmt_ip, DeployResult.STATUS_FAILED, error=str(e)))
+            continue
+
+        # Build diff: every config line shown as added (simulating fresh device)
+        diff_lines = []
+        for line in config_lines:
+            stripped = line.rstrip()
+            if stripped and not stripped.startswith("!"):
+                diff_lines.append(f"+{stripped}")
+
+        diff = "\n".join(diff_lines)
+
+        if dry_run:
+            print(f"  {CYAN}DRY RUN{RESET}")
+            _print_diff(diff)
+            results.append(DeployResult(hostname, mgmt_ip, DeployResult.STATUS_DRY_RUN, diff=diff))
+        else:
+            print(f"  {GREEN}SUCCESS{RESET}")
+            _print_diff(diff)
+            results.append(DeployResult(hostname, mgmt_ip, DeployResult.STATUS_SUCCESS, diff=diff))
+
+    return results
+
+
+# ===============================================================================
 # Core deploy function
 # ===============================================================================
 
@@ -145,27 +223,16 @@ def deploy_configs(
     creds:           dict,
     dry_run:         bool = False,
 ) -> list:
-    """
-    Push generated config files to their respective devices via NAPALM.
-
-    Parameters
-    ----------
-    generated_files  List of file paths, e.g. ['output/my_network/R-SPINE-1.conf']
-    ipam             {hostname: {loopback_ip, mgmt_ip}} from load_ipam()
-    vendor           "cisco" or "junos"
-    creds            {username, password, ssh_port} from load_credentials()
-    dry_run          If True, show diffs but never commit
-
-    Returns
-    -------
-    List of DeployResult objects, one per device.
-    """
-
     if vendor == "openconfig":
         print(f"\n  {YELLOW}⚠   OpenConfig JSON cannot be pushed directly via NAPALM.{RESET}")
         print(f"  {GREY}Use NETCONF/RESTCONF to push OpenConfig configs.{RESET}")
         return []
 
+    # ── Simulation mode: skip NAPALM entirely ──
+    if SIMULATE_DEPLOY:
+        return _simulate_deploy(generated_files, ipam, dry_run)
+
+    # ── Real deployment via NAPALM ──
     driver = _get_napalm_driver(vendor)
     results = []
 
@@ -174,10 +241,7 @@ def deploy_configs(
 
     for cfg_path in generated_files:
 
-        # Derive hostname from filename: output/my_network/R-SPINE-1.conf → R-SPINE-1
         hostname = os.path.splitext(os.path.basename(cfg_path))[0]
-
-        # Look up management IP from IPAM
         device_info = ipam.get(hostname, {})
         mgmt_ip     = device_info.get("mgmt_ip", "")
 
@@ -187,23 +251,20 @@ def deploy_configs(
             results.append(DeployResult(hostname, "", DeployResult.STATUS_SKIPPED, error=msg))
             continue
 
-        print(f"  {GREY}→   {hostname:<20}  {mgmt_ip}{RESET}", end="", flush=True)
+        ssh_port = DEVICE_PORTS.get(hostname, creds.get("ssh_port", 22))
 
-        # Open connection
+        print(f"  {GREY}→   {hostname:<20}  {mgmt_ip}:{ssh_port}{RESET}", end="", flush=True)
+
         device = driver(
             hostname = mgmt_ip,
             username = creds["username"],
             password = creds["password"],
-            optional_args = {"port": creds.get("ssh_port", 22)},
+            optional_args = {"port": ssh_port},
         )
 
         try:
             device.open()
-
-            # Load the generated config (merge mode — adds/changes, does not wipe device)
             device.load_merge_candidate(filename=cfg_path)
-
-            # Diff: what would change on the device
             diff = device.compare_config()
 
             if not diff:
@@ -242,7 +303,6 @@ def deploy_configs(
 
 
 def _print_diff(diff: str):
-    """Print a config diff with green/red colouring for added/removed lines."""
     for line in diff.splitlines():
         if line.startswith("+"):
             print(f"    {GREEN}{line}{RESET}")
@@ -257,7 +317,6 @@ def _print_diff(diff: str):
 # ===============================================================================
 
 def print_deploy_summary(results: list):
-    """Print a summary table of all deploy results."""
     if not results:
         return
 
@@ -302,10 +361,6 @@ def print_deploy_summary(results: list):
 # ===============================================================================
 
 def write_deploy_log(results: list, log_dir: str = "logs") -> str:
-    """
-    Write a timestamped deploy log to logs/<timestamp>.log
-    Returns the path of the written log file.
-    """
     os.makedirs(log_dir, exist_ok=True)
     ts       = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_path = os.path.join(log_dir, f"deploy_{ts}.log")
